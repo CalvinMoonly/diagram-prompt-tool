@@ -1,0 +1,12 @@
+node_modules/
+dist/
+
+# Secrets. .env.example is the tracked template.
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# NOT ignored, deliberately: .promptcanvas/graph.json is meant to diff in PRs
+# alongside the code it describes.
