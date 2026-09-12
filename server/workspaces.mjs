@@ -2,13 +2,14 @@ import fs from 'node:fs/promises'
 import fsSync from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { MAIN, isDiagramName } from './graph.mjs'
 
 // The workspace list spans repos, so it cannot live inside one. It is the only
 // state PromptCanvas keeps outside the projects it drives.
 const HOME = process.env.PROMPTCANVAS_HOME || path.join(os.homedir(), '.promptcanvas')
 export const CONFIG_PATH = path.join(HOME, 'workspaces.json')
 
-const EMPTY = { version: 1, activeId: null, workspaces: [] }
+const EMPTY = { version: 1, activeId: null, model: '', workspaces: [] }
 
 // Windows paths are case-insensitive; compare on a normalised form so the same
 // repo cannot be added twice under different spellings.
@@ -52,7 +53,17 @@ function normalise (config) {
       id,
       name: w.name || path.basename(dir),
       dir,
-      activeSessionId: w.activeSessionId ?? null
+      activeSessionId: w.activeSessionId ?? null,
+      // Which diagram this workspace is showing, plus what each session was last
+      // on. That mapping is what makes switching sessions switch the canvas.
+      diagram: isDiagramName(w.diagram) ? w.diagram : MAIN,
+      sessionDiagrams: Object.fromEntries(
+        Object.entries(w.sessionDiagrams ?? {}).filter(([, v]) => isDiagramName(v))
+      ),
+      // A session the user has started but not yet spoken to. It owns a real id
+      // and a real diagram; the SDK only writes its transcript on the first turn,
+      // so until then the picker lists it from here.
+      pendingSession: w.pendingSession?.id ? w.pendingSession : null
     })
   }
 
@@ -60,7 +71,9 @@ function normalise (config) {
     ? config.activeId
     : (workspaces[0]?.id ?? null)
 
-  return { version: 1, activeId, workspaces }
+  // Model choice is one setting for the tool, not per repo.
+  const model = typeof config.model === 'string' ? config.model : ''
+  return { version: 1, activeId, model, workspaces }
 }
 
 const BACKUP_PATH = CONFIG_PATH + '.bak'
@@ -152,15 +165,72 @@ export async function setActiveWorkspace (id) {
   return writeConfig({ ...config, activeId: id })
 }
 
-// Remembered per workspace, so switching back lands you in the same conversation.
+// Remembered per workspace, so switching back lands you in the same conversation
+// - and on the diagram that conversation was working on.
 export async function setActiveSession (workspaceId, sessionId) {
   const config = await readConfig()
   return writeConfig({
     ...config,
+    workspaces: config.workspaces.map(w => {
+      if (w.id !== workspaceId) return w
+      // No session means no diagram of its own yet: show the baseline until the
+      // first turn creates one.
+      if (!sessionId) return { ...w, activeSessionId: null, diagram: MAIN }
+      // A session that has been here before brings its diagram back; a new one
+      // adopts whatever is on screen, so starting a session never moves you.
+      const diagram = w.sessionDiagrams[sessionId] ?? w.diagram
+      return {
+        ...w,
+        activeSessionId: sessionId,
+        diagram,
+        sessionDiagrams: { ...w.sessionDiagrams, [sessionId]: diagram }
+      }
+    })
+  })
+}
+
+// Switching diagram by hand rebinds the live session to it, so coming back to
+// that conversation later brings this diagram with it.
+export async function setActiveDiagram (workspaceId, name) {
+  const config = await readConfig()
+  return writeConfig({
+    ...config,
+    workspaces: config.workspaces.map(w => {
+      if (w.id !== workspaceId) return w
+      const sessionDiagrams = w.activeSessionId
+        ? { ...w.sessionDiagrams, [w.activeSessionId]: name }
+        : w.sessionDiagrams
+      return { ...w, diagram: name, sessionDiagrams }
+    })
+  })
+}
+
+export async function setPendingSession (workspaceId, pending) {
+  const config = await readConfig()
+  return writeConfig({
+    ...config,
     workspaces: config.workspaces.map(w =>
-      w.id === workspaceId ? { ...w, activeSessionId: sessionId ?? null } : w
+      w.id === workspaceId ? { ...w, pendingSession: pending } : w
     )
   })
+}
+
+// Deleting a session drops its binding too, so the map cannot grow forever.
+export async function forgetSession (workspaceId, sessionId) {
+  const config = await readConfig()
+  return writeConfig({
+    ...config,
+    workspaces: config.workspaces.map(w => {
+      if (w.id !== workspaceId) return w
+      const { [sessionId]: _gone, ...rest } = w.sessionDiagrams
+      return { ...w, sessionDiagrams: rest }
+    })
+  })
+}
+
+export async function setModel (model) {
+  const config = await readConfig()
+  return writeConfig({ ...config, model: String(model ?? '') })
 }
 
 export async function activeWorkspace () {

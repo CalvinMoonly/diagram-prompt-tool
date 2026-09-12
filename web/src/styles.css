@@ -11,9 +11,17 @@
 
 * { box-sizing: border-box; }
 html, body, #root { height: 100%; margin: 0; }
+body { overflow: hidden; }
 body { background: var(--bg); color: var(--text); }
 
-.app { display: grid; grid-template-columns: minmax(320px, 30%) 1fr; grid-template-rows: auto 1fr; height: 100%; min-height: 0; }
+.app { display: grid; grid-template-columns: var(--chat-w, 30%) 6px 1fr; grid-template-rows: auto 1fr; height: 100%; min-height: 0; }
+
+/* Drag to trade width between the chat and the canvas. Excalidraw would happily
+   swallow the pointer once it leaves this strip, so the handle captures it. */
+.splitter { grid-row: 2; background: var(--line); cursor: col-resize; }
+.splitter:hover, .splitter.on { background: var(--accent); }
+.app.dragging { user-select: none; }
+.app.dragging .canvas { pointer-events: none; }
 
 /* ---- top: navigation (which repo, which conversation) ---- */
 .nav { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; padding: 8px 12px; background: var(--panel); border-bottom: 1px solid var(--line); }
@@ -22,30 +30,74 @@ body { background: var(--bg); color: var(--text); }
 .nav-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin-right: 2px; }
 .nav-error { color: #ff8787; font-size: 12px; }
 
-.tab { display: inline-flex; align-items: center; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
-.tab.on { border-color: var(--accent); background: #26304a; }
-.tab button { background: none; border: none; border-radius: 0; padding: 6px 10px; }
-.tab button:hover { border-color: transparent; background: #2b3040; }
-.tab.on .tab-name { color: var(--accent); font-weight: 600; }
-.tab-x { color: var(--muted); padding: 6px 8px !important; }
-
 .nav .add { display: flex; gap: 6px; }
-.nav input, .nav select { background: #0f1117; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 13px; }
+/* One rule for every picker in the app, so they cannot drift apart again. The
+   family is set explicitly rather than inherited: the model select sits inside
+   `.spend`, and `font: inherit` picked up that strip's monospace. */
+.nav input, .nav select, .spend select { background: #0f1117; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 13px; }
 .nav input { min-width: 240px; font-family: ui-monospace, monospace; font-size: 12px; }
-.nav select { max-width: 320px; }
+.nav select, .spend select { max-width: 320px; }
 
 .blank { flex: 1; display: grid; place-items: center; color: var(--muted); font-size: 13px; padding: 24px; text-align: center; }
 
 /* ---- left: chat ---- */
-.chat { grid-row: 2; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); min-width: 0; }
-.messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+/* min-height: 0 on both, or they keep their default `auto` and refuse to shrink below
+   their content - the transcript then makes the whole page tall and .messages never
+   gets to scroll. Same reason .canvas carries it. */
+.chat { grid-row: 2; display: flex; flex-direction: column; border-right: 1px solid var(--line); background: var(--panel); min-width: 0; min-height: 0; }
+.messages { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
 .hint { color: var(--muted); font-size: 13px; line-height: 1.5; }
 .msg { font-size: 14px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
 .msg.user { background: #232838; border-radius: 10px; padding: 10px 12px; }
 .msg.tool { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; }
 .msg.error { color: #ff8787; }
+.inspector-actions { display: flex; gap: 8px; }
+.link { background: none; border: none; padding: 0; color: var(--accent); text-decoration: underline; font: inherit; font-size: inherit; cursor: pointer; }
+.inspector-actions .primary { flex: 1; }
+.inspector-actions .danger { border-color: #ff8787; color: #ff8787; }
+.msg.usage { color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }
+
+/* Proof of life on a turn that can sit on one tool call for minutes. */
+.working { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+.spinner { width: 12px; height: 12px; flex: 0 0 auto; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
+
+.spend { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; border-top: 1px solid var(--line); padding: 6px 12px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }
+
+/* Rendered markdown from the agent. `pre-wrap` above is right for the raw text
+   roles, but here the renderer owns the line breaks. */
+.msg.assistant { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0 0 10px; }
+.md h1, .md h2, .md h3, .md h4, .md h5, .md h6 { margin: 16px 0 6px; line-height: 1.3; font-weight: 600; }
+.md h1 { font-size: 17px; }
+.md h2 { font-size: 15px; }
+.md h3, .md h4, .md h5, .md h6 { font-size: 14px; }
+.md ul, .md ol { margin: 0 0 10px; padding-left: 20px; }
+.md li { margin: 3px 0; }
+.md li > p { margin: 0 0 4px; }
+.md li > ul, .md li > ol { margin: 3px 0 0; }
+.md a { color: var(--accent); }
+.md hr { border: none; border-top: 1px solid var(--line); margin: 14px 0; }
+.md blockquote { margin: 0 0 10px; padding-left: 10px; border-left: 2px solid var(--line); color: var(--muted); }
+.md code { background: #0f1117; border: 1px solid var(--line); border-radius: 4px; padding: 1px 4px; font-family: ui-monospace, monospace; font-size: 12px; }
+.md pre { margin: 0 0 10px; padding: 10px; background: #0f1117; border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; }
+.md pre code { background: none; border: none; padding: 0; font-size: 12px; line-height: 1.5; }
+
+/* Wide tables scroll inside the message instead of stretching the chat column. */
+.md-table { margin: 0 0 10px; overflow-x: auto; }
+.md table { border-collapse: collapse; font-size: 12px; }
+/* `.msg` sets word-break: break-word for long paths in prose, but in a narrow
+   column it shreds ordinary words into "servic e". Cells wrap at spaces and the
+   table scrolls instead; only an unbreakable token gets split. */
+.md th, .md td { border: 1px solid var(--line); padding: 4px 8px; text-align: left; vertical-align: top; word-break: normal; overflow-wrap: break-word; }
+.md th { background: #232838; font-weight: 600; white-space: nowrap; }
 
 .chat form { border-top: 1px solid var(--line); padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.send-row { display: flex; gap: 8px; }
+.send-row .primary { flex: 1; }
 .chat textarea { resize: vertical; background: #0f1117; color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 10px; font: inherit; font-size: 14px; }
 .scope { display: flex; align-items: center; gap: 8px; }
 .chip { background: #26304a; color: var(--accent); border-radius: 999px; padding: 3px 10px; font-size: 12px; }
@@ -57,9 +109,12 @@ button.primary { background: var(--accent); color: #0b0d12; border-color: transp
 button:disabled { opacity: .6; cursor: default; }
 
 /* ---- right: canvas ---- */
-main { grid-row: 2; position: relative; display: flex; flex-direction: column; min-width: 0; }
+main { grid-row: 2; position: relative; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
 .bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 12px; border-bottom: 1px solid var(--line); background: var(--panel); }
-.dir { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dir { flex: 1 1 auto; min-width: 40px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Which diagram this session owns. A label, not a control: you never pick one.
+   Never shrinks - the long path beside it is what gives way. */
+.dir-diagram { flex: 0 1 auto; max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 6px; border: 1px solid var(--line); border-radius: 6px; color: var(--muted); font-family: ui-monospace, monospace; font-size: 11px; }
 .bar button { border-color: var(--warn); color: var(--warn); }
 .canvas { flex: 1; min-height: 0; }
 
@@ -85,6 +140,10 @@ main { grid-row: 2; position: relative; display: flex; flex-direction: column; m
 .dot.job { background: #22b8cf; }
 .dot.ui { background: #9775fa; }
 .scan-evidence { margin: 6px 0 0; padding: 8px; background: #0f1117; border: 1px solid var(--line); border-radius: 6px; font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.5; white-space: pre-wrap; color: var(--muted); max-height: 180px; overflow-y: auto; }
+/* Scoped under .inspector to beat `.inspector label`, which stacks its fields in
+   a column - ScanPanel reuses the inspector shell, so that rule reaches here. */
+.inspector .scan-refine { display: flex; flex-direction: row; align-items: flex-start; gap: 8px; margin: 10px 0 8px; font-size: 12px; line-height: 1.4; color: var(--text); cursor: pointer; }
+.inspector .scan-refine input { margin: 2px 0 0; flex: 0 0 auto; }
 .scan-actions { display: flex; gap: 8px; }
 .scan-actions button { flex: 1; }
 .inspector details summary { cursor: pointer; }

@@ -34,35 +34,140 @@ export function composeServices (text) {
   let inServices = false
   let indent = null
   let current = null
+  let section = null      // 'environment' | 'depends_on', while inside that block
+  let sectionPad = null
+  let itemPad = null
 
   for (const raw of text.split(/\r?\n/)) {
     if (!raw.trim() || /^\s*#/.test(raw)) continue
+
+    // List form: `- kafka` under depends_on, `- KEY=value` under environment.
+    const item = raw.match(/^(\s*)-\s+(.+)$/)
+    if (item && current && section) {
+      const body = item[2].replace(/['"]/g, '').trim()
+      if (section === 'depends_on') current.dependsOn.push(body)
+      else {
+        const eq = body.indexOf('=')
+        if (eq > 0) current.env[body.slice(0, eq).trim()] = body.slice(eq + 1).trim()
+      }
+      continue
+    }
+
     const m = raw.match(/^(\s*)([^\s:#][^:]*):\s*(.*)$/)
     if (!m) continue
-    const [, pad, key, value] = m
+    const [, pad, rawKey, value] = m
+    const key = rawKey.trim()
+    const clean = value.replace(/['"]/g, '').trim()
 
     if (pad.length === 0) {
-      inServices = key.trim() === 'services'
+      inServices = key === 'services'
       indent = null
       current = null
+      section = null
       continue
     }
     if (!inServices) continue
     if (indent === null) indent = pad.length
 
     if (pad.length === indent) {
-      current = { name: key.trim(), image: null, build: false }
+      current = { name: key, image: null, build: false, context: null, command: '', env: {}, dependsOn: [] }
       out.push(current)
-    } else if (current) {
-      if (key.trim() === 'image') current.image = value.replace(/['"]/g, '').trim()
-      if (key.trim() === 'build') current.build = true
+      section = null
+      continue
+    }
+    if (!current) continue
+
+    // Any key back at or above the block's own indent ends the block.
+    if (section && pad.length <= sectionPad) section = null
+
+    if (section === 'environment') { current.env[key] = clean; continue }
+    if (section === 'depends_on') {
+      // Map form nests `condition:` under each name; only the names are deps.
+      if (itemPad === null) itemPad = pad.length
+      if (pad.length === itemPad) current.dependsOn.push(key)
+      continue
+    }
+
+    if (key === 'image') current.image = clean
+    if (key === 'command') current.command = clean
+    if (key === 'build') {
+      current.build = true
+      // `build: ./path` is the short form; the long form puts it in `context:`.
+      if (clean) current.context = clean
+    }
+    if (key === 'context') current.context = clean
+    if (key === 'environment' || key === 'depends_on') {
+      section = key
+      sectionPad = pad.length
+      itemPad = null
     }
   }
   return out
 }
 
+// What makes a build context a component rather than build infrastructure: its own
+// dependency manifest. `./docker/8.4` holds a Dockerfile and nothing else, so it is
+// this app being built; `./host_application` has requirements.txt, so it is a
+// codebase of its own. Evidence, not folder names.
+const MANIFESTS = [
+  'package.json', 'composer.json', 'requirements.txt', 'pyproject.toml',
+  'go.mod', 'Cargo.toml', 'Gemfile', 'pom.xml', 'build.gradle', 'setup.py'
+]
+const isOwnCodebase = async d => {
+  for (const m of MANIFESTS) {
+    try { await fs.access(path.join(d, m)); return true } catch {}
+  }
+  return false
+}
+
+// A service that declares `command: ... python -u main_reorder.py` has told us
+// which file it runs. Only accepted when that file really exists in the context.
+async function scriptFromCommand (dir, context, command) {
+  for (const m of String(command).matchAll(/([\w./-]+\.(?:py|js|mjs|ts|rb|go|php|sh))/g)) {
+    const rel = path.join(context.replace(/^\.\//, ''), path.basename(m[1]))
+    try { await fs.access(path.join(dir, rel)); return rel } catch {}
+  }
+  return null
+}
+
+// Compose says what each same-image service is for; this maps that to a kind.
+const ROLE_KINDS = { consumer: 'job', queue: 'job', scheduler: 'job', reverb: 'service', vite: 'ui', horizon: 'job' }
+
+// A worker declares the artisan command it runs. Locating the file that declares
+// that command lets the node own the code it actually executes - the command name
+// is the evidence; this only finds where it lives.
+async function findCommandFile (dir, command, root = 'app/Console') {
+  const needle = String(command).trim().split(/\s+/)[0]
+  if (!needle) return null
+  // Must match the whole signature, not a prefix of a longer one: the declared
+  // `kafka:consume-spbv1` is a prefix of `kafka:consume-spbv1-bd-events`, and a
+  // substring test hands the wrong file to the wrong worker.
+  const esc = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const signature = new RegExp(`['\"\`]\\s*${esc}(?=[\\s'\"\`{])`)
+  const stack = [path.join(dir, root)]
+  let scanned = 0
+  while (stack.length && scanned < 500) {
+    const cur = stack.pop()
+    let entries
+    try { entries = await fs.readdir(cur, { withFileTypes: true }) } catch { continue }
+    for (const e of entries) {
+      const full = path.join(cur, e.name)
+      if (e.isDirectory()) { stack.push(full); continue }
+      if (!e.name.endsWith('.php')) continue
+      scanned++
+      const text = await readText(full)
+      if (text && signature.test(text)) return path.relative(dir, full)
+    }
+  }
+  return null
+}
+
 const INFRA = [
+  // Admin UIs first: `kafka-ui` must not match the broker rule below.
+  { test: /kafka-ui|kafdrop|redisinsight|pgadmin|phpmyadmin|adminer|mongo-express/i, kind: 'external', label: 'Admin UI' },
   { test: /mysql|mariadb/i, kind: 'datastore', label: 'MySQL' },
+  { test: /mongo/i, kind: 'datastore', label: 'MongoDB' },
+  { test: /emqx|mosquitto|vernemq|hivemq/i, kind: 'queue', label: 'MQTT broker' },
   { test: /postgres|pgsql/i, kind: 'datastore', label: 'Postgres' },
   { test: /valkey|redis/i, kind: 'datastore', label: 'Redis / Valkey' },
   { test: /mailpit|mailhog/i, kind: 'external', label: 'Mail (dev)' },
@@ -82,11 +187,22 @@ export async function scanRepo (dir) {
   const edges = []
   const detected = []
 
-  const add = node => { nodes.push(node); return node.id }
+  // First one wins. Two rules can reach the same id - a compose service named
+  // `reverb` and laravel/reverb in composer.json both do - and a duplicate id is
+  // worse than a missing node: applyPatch only ever finds the first, so the second
+  // can never be edited or removed again.
+  const add = node => {
+    if (nodes.some(n => n.id === node.id)) return node.id
+    nodes.push(node)
+    return node.id
+  }
   const link = (from, to, label) => {
-    if (nodes.some(n => n.id === from) && nodes.some(n => n.id === to)) {
-      edges.push({ id: `e-${from}-${to}`, from, to, label })
-    }
+    const id = `e-${from}-${to}`
+    if (from === to) return false
+    if (edges.some(e => e.id === id)) return false
+    if (!nodes.some(n => n.id === from) || !nodes.some(n => n.id === to)) return false
+    edges.push({ id, from, to, label })
+    return true
   }
 
   const composer = await readJson(path.join(dir, 'composer.json'))
@@ -100,19 +216,77 @@ export async function scanRepo (dir) {
     const text = await readText(path.join(dir, file))
     if (!text) continue
     detected.push(`${file}: found`)
-    for (const svc of composeServices(text)) {
-      // A service built from this repo IS this repo; the code nodes represent it.
-      if (svc.build) { detected.push(`  ${svc.name}: built here, treated as this app`); continue }
-      const hit = INFRA.find(i => i.test.test(svc.name) || (svc.image && i.test.test(svc.image)))
+    const services = composeServices(text)
+
+    // Which images does this repo build? The question is never "does it declare
+    // build" but "what does it build FROM": a context with no manifest of its own
+    // is this app's build infrastructure, and its image is this app.
+    const ourImages = new Set()
+    for (const svc of services) {
+      if (!svc.build) continue
+      const context = (svc.context ?? '.').replace(/\/+$/, '')
+      const outside = context.startsWith('..') || path.isAbsolute(context)
+      if (!outside && !(await isOwnCodebase(path.join(dir, context)))) {
+        if (svc.image) ourImages.add(svc.image)
+        detected.push(`  ${svc.name}: built from ${context}, this app`)
+        continue
+      }
+      // A codebase of its own: it gets a node, owning the folder it builds from.
+      const script = outside ? null : await scriptFromCommand(dir, context, svc.command)
+      add({
+        id: slug(svc.name),
+        label: svc.name,
+        kind: outside ? 'external' : 'service',
+        paths: outside ? [] : [script ?? context.replace(/^\.\//, '')],
+        notes: `built from ${context}${outside ? ', outside this repo' : ''}${script ? `, runs ${path.basename(script)}` : ''}`
+      })
+      detected.push(`  ${svc.name}: built from ${context}${outside ? ' (separate repo)' : ' (own codebase, owns that folder)'}`)
+    }
+
+    for (const svc of services) {
+      if (svc.build) continue
       const id = slug(svc.name)
+      const notes = svc.image ? `compose service (${svc.image})` : 'compose service'
+
+      // Running an image we build makes this the app in another role - and compose
+      // says which role, so read it instead of calling the service external.
+      if (svc.image && ourImages.has(svc.image)) {
+        const role = svc.env.CONTAINER_ROLE ?? ''
+        const command = svc.env.CONSUME_COMMAND ?? svc.env.WORKER_COMMAND ?? ''
+        const file = command ? await findCommandFile(dir, command) : null
+        const queue = svc.env.QUEUE_NAME ? ` queue ${svc.env.QUEUE_NAME}` : ''
+        add({
+          id,
+          label: svc.name,
+          kind: ROLE_KINDS[role] ?? 'job',
+          paths: file ? [file] : [],
+          notes: `this app as ${role || 'worker'}${command ? `: ${command}` : ''}${queue}`
+        })
+        detected.push(
+          `  ${svc.name}: this app as ${role || 'worker'}` +
+          (command ? ` (${command}${file ? ` -> ${file}` : ', command file not found'})` : '')
+        )
+        continue
+      }
+
+      const hit = INFRA.find(i => i.test.test(svc.name) || (svc.image && i.test.test(svc.image)))
       if (hit) {
-        add({ id, label: hit.label, kind: hit.kind, paths: [], notes: svc.image ? `compose service (${svc.image})` : 'compose service' })
+        add({ id, label: hit.label, kind: hit.kind, paths: [], notes })
         detected.push(`  ${svc.name}: ${hit.label}`)
       } else {
-        add({ id, label: svc.name, kind: 'external', paths: [], notes: svc.image ? `compose service (${svc.image})` : 'compose service' })
+        add({ id, label: svc.name, kind: 'external', paths: [], notes })
         detected.push(`  ${svc.name}: unrecognised service, guessed external`)
       }
     }
+
+    // depends_on is declared topology - free edges the scanner used to throw away.
+    let wired = 0
+    for (const svc of services) {
+      for (const dep of svc.dependsOn) {
+        if (link(slug(svc.name), slug(dep), 'depends on')) wired++
+      }
+    }
+    if (wired) detected.push(`  depends_on: ${wired} edge(s)`)
     break
   }
 

@@ -1,0 +1,166 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "web",
+      "label": "Canvas UI",
+      "kind": "ui",
+      "paths": [
+        "web/src",
+        "web/index.html",
+        "vite.config.js"
+      ],
+      "notes": "React app: chat left, Excalidraw canvas right. App.jsx wires state, Chat.jsx reads the SSE stream, Canvas.jsx + graphToScene.js render the graph and save layout, Inspector/ScanPanel/Nav edit workspace, node and scan state. Not an editor — no file tree, no diffs.",
+      "x": 4,
+      "y": 111,
+      "w": 220,
+      "h": 90
+    },
+    {
+      "id": "api",
+      "label": "Express server",
+      "kind": "service",
+      "paths": [
+        "server/index.mjs"
+      ],
+      "notes": "All HTTP routes: /api/workspaces, /api/sessions, /api/graph, /api/nodes, /api/edges, /api/scan, /api/pick-folder, and /api/chat which runs the Agent SDK turn and streams it back over SSE.",
+      "x": 420,
+      "y": 120,
+      "w": 220,
+      "h": 90
+    },
+    {
+      "id": "canvas-tools",
+      "label": "Canvas MCP tools",
+      "kind": "service",
+      "paths": [
+        "server/tools.mjs"
+      ],
+      "notes": "In-process SDK MCP server exposing get_graph, get_node and patch_graph. Rebuilt per turn with the active workspace dir closed over, so the agent can only touch that repo's graph.",
+      "x": 1080,
+      "y": 227,
+      "w": 220,
+      "h": 90
+    },
+    {
+      "id": "graph-store",
+      "label": "Graph store",
+      "kind": "datastore",
+      "paths": [
+        "server/graph.mjs",
+        ".promptcanvas"
+      ],
+      "notes": "Per-workspace <dir>/.promptcanvas/graph.json. applyPatch strips x/y/w/h so structure stays the agent's and layout stays the user's; also does free-slot auto-placement and PR-friendly serialisation.",
+      "x": 1099,
+      "y": 22,
+      "w": 220,
+      "h": 90
+    },
+    {
+      "id": "scanner",
+      "label": "Repo scanner",
+      "kind": "job",
+      "paths": [
+        "server/scan.mjs"
+      ],
+      "notes": "Evidence-based draft diagram from compose services, package/composer manifests and workspace packages. No LLM, no network. Never derives nodes from the folder tree.",
+      "x": 80,
+      "y": 340,
+      "w": 220,
+      "h": 90
+    },
+    {
+      "id": "workspaces",
+      "label": "Workspace registry",
+      "kind": "datastore",
+      "paths": [
+        "server/workspaces.mjs"
+      ],
+      "notes": "~/.promptcanvas/workspaces.json — the repo list plus active workspace/session. The only state living outside the projects it drives. Atomic writes with a .bak.",
+      "x": 420,
+      "y": 340,
+      "w": 220,
+      "h": 90
+    },
+    {
+      "id": "folder-picker",
+      "label": "Native folder dialog",
+      "kind": "external",
+      "paths": [
+        "server/pickFolder.mjs"
+      ],
+      "notes": "Spawns the OS folder chooser server-side to back the Browse… button when adding a workspace.",
+      "x": 741,
+      "y": 416,
+      "w": 220,
+      "h": 90
+    },
+    {
+      "id": "agent-sdk",
+      "label": "Claude Agent SDK",
+      "kind": "external",
+      "paths": [],
+      "notes": "query() runs the turn against the Anthropic API and owns the session store the picker lists. Reached only from /api/chat; needs ANTHROPIC_API_KEY in .env.",
+      "x": 1098,
+      "y": 427,
+      "w": 220,
+      "h": 90
+    }
+  ],
+  "edges": [
+    {
+      "id": "e-web-api",
+      "from": "web",
+      "to": "api",
+      "label": "REST + SSE chat stream"
+    },
+    {
+      "id": "e-api-graph",
+      "from": "api",
+      "to": "graph-store",
+      "label": "reads/writes graph.json"
+    },
+    {
+      "id": "e-api-workspaces",
+      "from": "api",
+      "to": "workspaces",
+      "label": "workspace + session config"
+    },
+    {
+      "id": "e-api-scanner",
+      "from": "api",
+      "to": "scanner",
+      "label": "scanRepo(dir) for scan preview"
+    },
+    {
+      "id": "e-api-picker",
+      "from": "api",
+      "to": "folder-picker",
+      "label": "Browse… dialog"
+    },
+    {
+      "id": "e-api-sdk",
+      "from": "api",
+      "to": "agent-sdk",
+      "label": "query(prompt), streams messages"
+    },
+    {
+      "id": "e-api-tools",
+      "from": "api",
+      "to": "canvas-tools",
+      "label": "builds MCP server per turn"
+    },
+    {
+      "id": "e-sdk-tools",
+      "from": "agent-sdk",
+      "to": "canvas-tools",
+      "label": "calls get_graph / patch_graph"
+    },
+    {
+      "id": "e-tools-graph",
+      "from": "canvas-tools",
+      "to": "graph-store",
+      "label": "applyPatch, read/write"
+    }
+  ]
+}

@@ -8,5 +8,9 @@ dist/
 # macOS
 .DS_Store
 
-# NOT ignored, deliberately: .promptcanvas/graph.json is meant to diff in PRs
-# alongside the code it describes.
+# Per-session diagrams: one per conversation, named after whoever's opening prompt
+# created them. Personal working state, not something to share.
+.promptcanvas/graphs/
+
+# NOT ignored, deliberately: .promptcanvas/graph.json is the canonical map, meant to
+# diff in PRs alongside the code it describes. That is the point of the tool.

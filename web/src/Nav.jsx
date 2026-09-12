@@ -73,18 +73,25 @@ export default function Nav ({
     <nav className="nav">
       <div className="nav-group">
         <span className="nav-label">Workspace</span>
-        {workspaces.map(w => (
-          <span key={w.id} className={`tab ${w.id === activeId ? 'on' : ''}`}>
-            <button className="tab-name" onClick={() => onPickWorkspace(w.id)} title={w.dir}>
-              {w.name}
-            </button>
+        {active && (
+          <>
+            {/* Deliberately not disabled while busy: switching repo mid-turn is
+                how you look around without starting a second one. */}
+            <select
+              value={activeId ?? ''}
+              title={active.dir}
+              onChange={e => onPickWorkspace(e.target.value)}
+            >
+              {workspaces.map(w => (
+                <option key={w.id} value={w.id} title={w.dir}>{w.name}</option>
+              ))}
+            </select>
             <button
-              className="tab-x"
-              title={`Remove ${w.name} from this bar (nothing on disk is deleted)`}
-              onClick={() => onRemoveWorkspace(w.id)}
-            >×</button>
-          </span>
-        ))}
+              title={`Remove ${active.name} from this bar (nothing on disk is deleted)`}
+              onClick={() => onRemoveWorkspace(active.id)}
+            >remove</button>
+          </>
+        )}
 
         {adding ? (
           <form className="add" onSubmit={submitAdd}>
@@ -126,7 +133,7 @@ export default function Nav ({
                   disabled={busy}
                   onChange={e => onPickSession(e.target.value || null)}
                 >
-                  <option value="">{activeSessionId ? 'Switch to...' : 'New session (unsaved)'}</option>
+                  <option value="">{activeSessionId ? 'Switch to...' : 'No session yet'}</option>
                   {sessions.map(s => (
                     <option key={s.sessionId} value={s.sessionId}>
                       {s.title} - {ago(s.lastModified)}

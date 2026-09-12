@@ -6,6 +6,7 @@ export default function ScanPanel ({ onApply, onClose, onPreview }) {
   const [draft, setDraft] = useState(null)
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const [refine, setRefine] = useState(true)
 
   useEffect(() => {
     onPreview().then(setDraft).catch(err => setError(err.message))
@@ -14,7 +15,7 @@ export default function ScanPanel ({ onApply, onClose, onPreview }) {
   const apply = async replace => {
     setBusy(true)
     try {
-      await onApply(replace)
+      await onApply(replace, refine)
       onClose()
     } catch (err) {
       setError(err.message)
@@ -62,12 +63,26 @@ export default function ScanPanel ({ onApply, onClose, onPreview }) {
           </details>
 
           {draft.nodes.length > 0 && (
-            <div className="scan-actions">
-              <button className="primary" disabled={busy} onClick={() => apply(true)}>
-                Replace diagram
-              </button>
-              <button disabled={busy} onClick={() => apply(false)}>Merge in</button>
-            </div>
+            <>
+              <label className="scan-refine" title="Applies to whichever button you press">
+                <input
+                  type="checkbox"
+                  checked={refine}
+                  onChange={e => setRefine(e.target.checked)}
+                />
+                <span>
+                  Then let the agent check it against the code
+                  <span className="muted"> - costs a turn</span>
+                </span>
+              </label>
+
+              <div className="scan-actions">
+                <button className="primary" disabled={busy} onClick={() => apply(true)}>
+                  Replace diagram
+                </button>
+                <button disabled={busy} onClick={() => apply(false)}>Merge in</button>
+              </div>
+            </>
           )}
         </>
       )}

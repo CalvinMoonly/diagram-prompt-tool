@@ -34,13 +34,16 @@ function summarise (graph) {
   return `nodes:\n${nodes || '  (none)'}\nedges:\n${edges || '  (none)'}`
 }
 
-function buildTools (dir) {
+function buildTools (dir, activeDiagram, { layout = false, onWrite } = {}) {
+  // A function, not a name: for a new session the diagram does not exist yet when
+  // this server is built, so every call resolves it fresh.
+  const diagram = () => (typeof activeDiagram === 'function' ? activeDiagram() : activeDiagram)
   const getGraph = tool(
     'get_graph',
     'Read the architecture graph: every node (component) with the repo paths it owns, and every edge between them. Call this before reasoning about where code lives.',
     {},
     async () => {
-      const graph = await readGraph(dir)
+      const graph = await readGraph(dir, diagram())
       return {
         content: [{ type: 'text', text: summarise(graph) }],
         structuredContent: graph
@@ -54,7 +57,7 @@ function buildTools (dir) {
     'Read one node of the architecture graph by id, including the repo paths it owns and its neighbours.',
     { id: z.string().describe('Node id, e.g. "api"') },
     async (args) => {
-      const graph = await readGraph(dir)
+      const graph = await readGraph(dir, diagram())
       const node = graph.nodes.find(n => n.id === args.id)
       if (!node) {
         return {
@@ -92,9 +95,10 @@ function buildTools (dir) {
       why: z.string().default('').describe('One sentence: what changed in the system and why the diagram moved with it')
     },
     async (args) => {
-      const current = await readGraph(dir)
+      const current = await readGraph(dir, diagram())
       const { graph, touched } = applyPatch(current, args)
-      const saved = await writeGraph(dir, graph)
+      const saved = await writeGraph(dir, diagram(), graph)
+      onWrite?.(saved)
       return {
         content: [{
           type: 'text',
@@ -105,16 +109,56 @@ function buildTools (dir) {
     }
   )
 
-  return [getGraph, getNode, patchGraph]
+  // Positions only, and only handed to the agent on a turn the user started from
+  // "Arrange with AI". Every other turn gets the three tools above, so layout stays
+  // the user's exactly as before.
+  const setLayout = tool(
+    'set_layout',
+    'Move boxes on the canvas. Positions only: this cannot add, remove, rename or re-link anything. Coordinates are the top-left corner of a box in canvas units, x rightwards and y downwards. Boxes are 220 wide and 90 tall unless the graph says otherwise.',
+    {
+      positions: z.array(z.object({
+        id: z.string().describe('Node id'),
+        x: z.number(),
+        y: z.number()
+      })).describe('Where each box should sit. Nodes you leave out keep their current position.'),
+      why: z.string().default('').describe('One sentence: how you arranged it')
+    },
+    async (args) => {
+      const graph = await readGraph(dir, diagram())
+      const moved = new Map(args.positions.map(p => [p.id, p]))
+      const unknown = args.positions.filter(p => !graph.nodes.some(n => n.id === p.id)).map(p => p.id)
+      const nodes = graph.nodes.map(n => (
+        moved.has(n.id)
+          ? { ...n, x: Math.round(moved.get(n.id).x), y: Math.round(moved.get(n.id).y) }
+          : n
+      ))
+      const saved = await writeGraph(dir, diagram(), { ...graph, nodes })
+      onWrite?.(saved)
+      return {
+        content: [{
+          type: 'text',
+          text: `Moved ${args.positions.length - unknown.length} of ${saved.nodes.length} boxes${args.why ? `: ${args.why}` : ''}.` +
+            (unknown.length ? ` Unknown ids ignored: ${unknown.join(', ')}.` : '')
+        }],
+        structuredContent: { graph: saved }
+      }
+    }
+  )
+
+  return layout ? [getGraph, getNode, patchGraph, setLayout] : [getGraph, getNode, patchGraph]
 }
 
-export function createCanvasServer (dir) {
-  return createSdkMcpServer({ name: 'canvas', version: '0.1.0', tools: buildTools(dir) })
+// Built per turn with the workspace dir AND the diagram it is working on closed
+// over, so the agent can only touch the one the user is looking at.
+export function createCanvasServer (dir, activeDiagram, opts) {
+  return createSdkMcpServer({
+    name: 'canvas', version: '0.1.0', tools: buildTools(dir, activeDiagram, opts)
+  })
 }
 
 // The wildcard is the allow rule the SDK wants; the exact names are for the
 // permission callback. Both derive from the same tool list, so a tool added in
 // buildTools needs no further wiring to become usable on the next message.
 export const CANVAS_TOOLS = ['mcp__canvas__*']
-const CANVAS_TOOL_NAMES = new Set(buildTools('.').map(t => `mcp__canvas__${t.name}`))
+const CANVAS_TOOL_NAMES = new Set(buildTools('.', null, { layout: true }).map(t => `mcp__canvas__${t.name}`))
 export const isCanvasTool = name => CANVAS_TOOL_NAMES.has(name)

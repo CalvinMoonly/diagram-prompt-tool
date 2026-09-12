@@ -12,9 +12,25 @@ When it changes the shape of the system it has to update the diagram in the same
 |---|---|---|
 | `.promptcanvas/graph.json` | the agent | nodes, edges, which folders each node owns |
 | node `x`/`y` inside it | you | where the boxes sit |
+| `.promptcanvas/graphs/<name>.json` | the agent | extra named diagrams, if you make any |
 
 `graph.json` lives inside the project you are working on, so it diffs in pull requests
 alongside the code it describes.
+
+### Diagrams
+
+Each session owns one diagram, and you never choose it. `main` is `graph.json` and stays
+the baseline; **+ session** creates the session and branches `main` into
+`.promptcanvas/graphs/<name>.json` in the same click, so a new session is a normal entry
+in the picker straight away — no typing required first. (Type into a workspace with no
+session at all and one is still created for you, named after that first prompt.) From
+then on that conversation and that diagram travel together — switching session switches
+the canvas, so one conversation can sit on the real architecture while another sketches a
+refactor. The bar shows which diagram you are on; it is a label, not a picker.
+
+Two consequences worth knowing. Improvements made in one session stay in that session's
+diagram rather than flowing back into `main`. And there is no delete button — remove a
+diagram by deleting its file.
 
 ## Run it
 
@@ -22,11 +38,14 @@ Needs Node 20.12+ (for `--env-file-if-exists`).
 
 ```bash
 npm install
-cp .env.example .env      # set ANTHROPIC_API_KEY and PROJECT_DIR
+cp .env.example .env      # set ANTHROPIC_API_KEY
 npm run dev
 ```
 
-Open http://localhost:5180 and drag it to your second monitor.
+Open http://localhost:5180 and drag it to your second monitor. Add the repo you want
+to work on with **+ repo** or **Browse…** — workspaces live in
+`~/.promptcanvas/workspaces.json`, not in `.env`. (`PROJECT_DIR` is still read once, on
+a first run with no workspaces, so an older `.env` setup keeps working.)
 
 ### Auth
 
@@ -50,34 +69,105 @@ A new repo opens on a placeholder diagram. Two ways to make it describe the real
    services, composer/package dependencies, workspace packages - and drafts components
    and edges from that. No API key, no tokens, instant. Preview first, then **Replace**
    or **Merge**. Positions of boxes you already placed are kept.
-2. **Then prompt the agent to refine it.** It calls `get_graph`, sees the draft, and
-   corrects labels, folders and edges from the actual code - which is far cheaper and
-   more accurate than discovering the whole repo cold.
+2. **Then let the agent refine it.** Tick *"Then let the agent check it against the
+   code"* in the scan panel and it runs automatically after Replace or Merge, with the
+   scan's evidence trail included in the prompt so the agent knows what was guessed and
+   why. It calls `get_graph`, sees the draft, and corrects labels, folders and edges from
+   the actual code - far cheaper and more accurate than discovering the whole repo cold.
+   Untick it to apply the draft alone and spend no tokens.
 
-`server/scan.mjs` holds the heuristics. The rule it follows: **emit a node only where
+`server/scan.mjs` holds the heuristics. From compose it reads the image, the build
+context, `environment`, `command` and `depends_on` - so a service that declares
+`CONSUME_COMMAND: kafka:consume-spbv1` becomes a node owning the file that declares that
+command, and `depends_on` becomes edges. A build context with its own manifest (say
+`./host_application` with a `requirements.txt`) is a component that owns that folder;
+one without is this app's build setup. The rule it follows: **emit a node only where
 there is evidence** of a component - a declared dependency, a compose service, a
 workspace package. Never one node per directory. A diagram generated from the folder
 tree is just the folder tree, which is the thing this is not. Laravel, Node and
 compose are covered; add your own stack there.
 
-**+ component** adds a node by hand. It POSTs to the server exactly like the agent's
-patch does - drawing a rectangle on the canvas still does nothing.
+### Editing the diagram yourself
+
+The canvas is a real editor. You can:
+
+- **draw a box** — becomes a component, where you drew it
+- **draw an arrow between two boxes** — becomes a connection
+- **double-click either** — renames it
+- **drag an arrow's end onto another box** — moves the connection
+- **drag or resize a box** — layout is yours and always has been
+- **recolour a box** — Excalidraw's stroke/background pickers now stick. Colour normally
+  comes from the component's *kind* (green datastore, purple queue, teal job), so an
+  override breaks that box out of the legend; the inspector offers a one-click **reset to
+  the kind colour**. The agent can never set a colour — its lever is `kind`
+- **+ component** / the inspector — the same things via forms, plus **delete**
+
+Every one of those goes through the server, exactly like the agent's `patch_graph` — the
+canvas never writes `graph.json` directly. The one thing it will not do is delete:
+pressing Backspace puts the element straight back, because a slip there costs components
+and their connections. Delete from the inspector, which asks first. Both POST to the server exactly like the agent's patch does -
+drawing a rectangle on the canvas still does nothing, and deleting one there changes
+nothing either.
 
 ## How you use it
 
-1. Click a box. It becomes the scope chip above the prompt box, and the inspector opens
-   so you can set which folders that box owns.
+1. Click a box **or an arrow**. It becomes the scope chip above the prompt box, and
+   **everything more than one hop away dims** so you can actually read a busy diagram.
+   Clicking a box also opens the inspector, where you set which folders it owns. Click
+   empty canvas to clear it.
+
+   Scoping to an arrow is for questions about the wire rather than the box — "make this
+   retry", "this should be async", "drop this dependency". The agent is given both ends
+   and the code each of them owns.
 2. Type what you want changed. The agent gets the graph plus your selected node's paths.
-3. It edits code, then calls `patch_graph`. Boxes it touched turn orange.
+3. It edits code, then calls `patch_graph`. Boxes it touched turn orange, and the canvas
+   updates **as the turn runs** rather than at the end of it. While a turn is running the
+   canvas is read-only — still visible and pannable, and you can still click boxes to move
+   the focus around or clear it. That is just looking: the turn keeps the component it was
+   sent with, shown as a chip on your message. Editing — dragging, the Inspector's Save —
+   is blocked until the turn ends.
 4. Read the diff in VS Code. Hit **mark reviewed** when you are happy and the orange clears.
 
-## The agent's three tools
+Under the prompt box you get a spinner with elapsed time while a turn runs (some take
+minutes), a **Stop** button to interrupt it, the tokens and cost for the last turn and for
+the session, and the model picker.
+
+Reloading during a turn is safe. The turn keeps running on the server; the page notices
+and shows the spinner again, then refreshes with whatever you missed once it finishes.
+
+## Keeping the shared map current
+
+Each session works in its own diagram, and those are gitignored — personal working state.
+`.promptcanvas/graph.json` is the one that gets committed. Two buttons in the canvas bar
+bridge the two: **view main** shows the canonical map read-only without leaving your
+session, and **promote to main** copies what you have over it (with a confirm, since that
+is the file a pull request reviews).
+
+## Laying it out
+
+Arrows are routed at right angles and steer around boxes; a diagonal tells you nothing
+about where a line is going, so there aren't any.
+
+**Arrange with AI** is what moves the boxes. It costs a turn and can take several
+minutes, but on a 36-node diagram it placed every box so that *no* arrow crosses a box.
+It is the only thing that may move your boxes, and only when you press it.
+
+There was an offline `Tidy layout` button that arranged boxes along the flow of the
+arrows. It was removed: measured on real graphs it helped about as often as it hurt
+(56% → 54% of arrows crossing a box on one, 68% → **77%** on another), so it was not
+worth the space or the confusion.
+
+Drag the divider between the chat and the canvas to trade width between them. The
+position is remembered per browser.
+
+## The agent's tools
 
 | Tool | Does |
 |---|---|
 | `get_graph` | reads the whole map: nodes, kinds, owned folders, edges |
 | `get_node` | one node plus its neighbours |
 | `patch_graph` | adds/edits/removes nodes and edges, marks them as changed |
+| `set_layout` | moves boxes, positions only — **only** on an *Arrange with AI* turn |
 
 They live in `server/tools.mjs` as an in-process MCP server. Add a tool there and the
 agent can use it on the next message — no restart of anything but the server.
@@ -92,8 +182,10 @@ agent can use it on the next message — no restart of anything but the server.
   Yours are probably more like `edge-node`, `ota-channel`, `booking-provider`.
 - **`systemPrompt`** — the `{ type: 'preset', preset: 'claude_code', append }` shape is
   verified against Agent SDK 0.3.269. If a version bump breaks it, that is the line to check.
-- **Model choice** — not set anywhere yet, so it uses the SDK default. Add `model:` to the
-  options in `server/index.mjs` when you care about cost per turn.
+- **Model choice** — pick it from the dropdown under the prompt box (Opus / Sonnet /
+  Haiku, or the SDK default). It is stored in `~/.promptcanvas/workspaces.json` and the
+  resolved model id is shown beside it after each turn. `MODELS` in `server/index.mjs`
+  is the list.
 
 ## Known rough edges in this skeleton
 
@@ -102,9 +194,10 @@ agent can use it on the next message — no restart of anything but the server.
   store via listSessions/getSessionMessages, so they survive restarts. A single lock
   still allows only one turn running anywhere — switching workspaces mid-turn lets you
   look around but not start a second turn.
-- Session lists are per repo and come from the SAME store Claude Code uses, so your
-  own terminal sessions for that repo appear in the picker too. tagSession() is the
-  hook if you ever want to separate them.
+- Session lists are per repo and come from the SAME store Claude Code uses, but the
+  picker shows only PromptCanvas's own: every turn tags its session `promptcanvas`, and
+  both the list and `resume` skip anything untagged, so your terminal sessions for that
+  repo stay out of the tool and are never resumed into a turn.
 - Excalidraw would fetch its element fonts from esm.sh by default. `web/index.html` sets
   `window.EXCALIDRAW_ASSET_PATH = '/'` and the `excalidraw-fonts` plugin in
   `vite.config.js` serves them from `node_modules` in dev and copies them into the
@@ -115,3 +208,11 @@ agent can use it on the next message — no restart of anything but the server.
   the two boxes they join. The skeleton API does NOT position them from `start`/`end` —
   it reads the arrow's own `x`/`y` to place the endpoints, so omitting them yields NaN.
 - Layout saves on a 900 ms debounce after you stop dragging.
+- Arrow routing is computed for the whole graph at once, so lines can be kept apart —
+  parallel runs sit at least 5px apart, because two lines closer than that read as one.
+  Lines crossing each other is fine and unavoidable; overlapping is not. A couple of
+  horizontal pairs from *different* boxes can still land 3–4px apart.
+- Past roughly 30 nodes no arrangement reads well on its own — that is what focus mode is
+  for.
+- `Arrange with AI` is slow: emitting one position per box as structured tool input takes
+  a few minutes for 30-odd boxes. The spinner tells you it is still alive.
