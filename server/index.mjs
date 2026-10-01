@@ -20,7 +20,9 @@ const PORT = Number(process.env.PORT || 8787)
 
 // Aliases rather than pinned ids, so a pick keeps working as versions move. The
 // SDK reports the model it actually resolved to at `init`, and that is what the
-// UI shows - so the label here never has to be the source of truth.
+// UI shows - so the label here never has to be the source of truth. An alias
+// resolves inside the CLI the SDK bundles, so it only moves when the SDK does:
+// on 0.3.269 "opus" was still Opus 5, at $5/$25 against Opus 5.5's $4/$20.
 const MODELS = [
   { id: '', label: 'Default (SDK picks)' },
   { id: 'opus', label: 'Opus - most capable' },
@@ -288,6 +290,16 @@ app.post('/api/acknowledge', (req, res) => withWorkspace(res, async (workspace, 
   res.json({ graph: await writeGraph(workspace.dir, diagram, graph) })
 }))
 
+// Empties the session's diagram. Never main: that is the committed map, and the
+// only way to change it wholesale is promote. Hands back what was there, so the
+// client can undo with a plain PUT of it.
+app.post('/api/graph/clear', (req, res) => withWorkspace(res, async (workspace, diagram) => {
+  if (diagram === MAIN) throw new Error('main is the committed map - start a session to clear a diagram')
+  const previous = await readGraph(workspace.dir, diagram)
+  const graph = await writeGraph(workspace.dir, diagram, { version: 1, nodes: [], edges: [] })
+  res.json({ graph, previous })
+}))
+
 
 /* ---- bootstrapping an overview ---- */
 
@@ -393,8 +405,9 @@ app.post('/api/edges', (req, res) => withWorkspace(res, async (workspace, diagra
   res.json({ graph: await writeGraph(workspace.dir, diagram, graph) })
 }))
 
-// Label and endpoints are the only things an edge has. The id stays put even when
-// the ends change, so anything already pointing at this edge keeps working.
+// Label, endpoints and hand-drawn route are the only things an edge has. The id
+// stays put even when the ends change, so anything already pointing at this edge
+// keeps working.
 app.patch('/api/edges/:id', (req, res) => withWorkspace(res, async (workspace, diagram) => {
   const graph = await readGraph(workspace.dir, diagram)
   const edge = graph.edges.find(e => e.id === req.params.id)
@@ -403,11 +416,18 @@ app.patch('/api/edges/:id', (req, res) => withWorkspace(res, async (workspace, d
   if (typeof req.body?.label === 'string') edge.label = req.body.label.trim()
   for (const end of ['from', 'to']) {
     const next = req.body?.[end]
-    if (typeof next !== 'string' || !next) continue
+    if (typeof next !== 'string' || !next || next === edge[end]) continue
     if (!graph.nodes.some(n => n.id === next)) throw new Error(`no component "${next}"`)
     edge[end] = next
+    // Its bends were drawn for the old ends.
+    delete edge.route
   }
   if (edge.from === edge.to) throw new Error('a connection needs two different components')
+  // null puts it back on the automatic route; normalise() validates the rest.
+  if (req.body && 'route' in req.body) {
+    if (req.body.route) edge.route = req.body.route
+    else delete edge.route
+  }
 
   res.json({ graph: await writeGraph(workspace.dir, diagram, graph) })
 }))
@@ -519,6 +539,12 @@ app.post('/api/chat', async (req, res) => {
   if (workspace.activeSessionId && !resumeId && workspace.activeSessionId !== pendingId) {
     await setActiveSession(workspace.id, null)
   }
+  // Arrange with AI runs on its own: laying out boxes needs the graph, not the
+  // conversation. Resumed, a bab-lc arrange turn carried 82.7k tokens of an earlier
+  // repo exploration, all rewritten to the cache because it had gone cold. It is not
+  // saved to the session either, so it neither switches the session nor births a new
+  // one - which also means it does not come back in the transcript after a reload.
+  const layoutTurn = !!allowLayout
 
   // The transcript file does not exist yet when `init` hands us the session id,
   // so tagSession cannot find it there. Claim the session at the end of the turn
@@ -571,7 +597,9 @@ app.post('/api/chat', async (req, res) => {
         ...(model ? { model } : {}),
         // A session started from `+ session` already has an id and a diagram, so
         // hand the SDK that id rather than letting it mint a second one.
-        ...(resumeId ? { resume: resumeId } : pendingId ? { sessionId: pendingId } : {}),
+        ...(layoutTurn
+          ? { persistSession: false }
+          : resumeId ? { resume: resumeId } : pendingId ? { sessionId: pendingId } : {}),
         // set_layout exists only on a turn the user started from "Arrange with AI".
         mcpServers: {
           // Every write goes straight down the stream, so the canvas follows the
@@ -581,6 +609,11 @@ app.post('/api/chat', async (req, res) => {
             onWrite: graph => send('graph', { graph })
           })
         },
+        // `tools` is what the agent is offered; `allowedTools` only auto-approves.
+        // Without it the preset offers ~30 tools - PowerShell, web search, cron,
+        // workflows - each one a definition in every call's prompt, and the agent
+        // spent round trips on PowerShell before being refused.
+        tools: ALLOWED_BUILTINS,
         allowedTools: [...CANVAS_TOOLS, ...ALLOWED_BUILTINS],
         permissionMode: 'acceptEdits',
         systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_RULES },
@@ -597,7 +630,7 @@ app.post('/api/chat', async (req, res) => {
     running = { turn, abort, workspace: workspace.name }
 
     for await (const message of turn) {
-      if (message.type === 'system' && message.subtype === 'init') {
+      if (message.type === 'system' && message.subtype === 'init' && !layoutTurn) {
         // A fresh conversation gets its id here; remember it so the session
         // shows up in the picker and the next turn resumes it.
         sessionId = message.session_id
@@ -612,7 +645,9 @@ app.post('/api/chat', async (req, res) => {
         await setActiveSession(workspace.id, message.session_id)
         if (diagram !== MAIN) await setActiveDiagram(workspace.id, diagram)
         send('session', { sessionId: message.session_id })
-        if (message.model) send('model', { model: message.model })
+      }
+      if (message.type === 'system' && message.subtype === 'init' && message.model) {
+        send('model', { model: message.model })
       }
       if (message.type === 'assistant') {
         if (message.error) send('error', { message: String(message.error) })
@@ -622,7 +657,7 @@ app.post('/api/chat', async (req, res) => {
         }
       }
       if (message.type === 'result') {
-        if (message.session_id) {
+        if (message.session_id && !layoutTurn) {
           sessionId = message.session_id
           await setActiveSession(workspace.id, message.session_id)
         }

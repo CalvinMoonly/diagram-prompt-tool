@@ -1,11 +1,25 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { Excalidraw, viewportCoordsToSceneCoords } from '@excalidraw/excalidraw'
 import '@excalidraw/excalidraw/index.css'
-import { graphToElements, applyFocus, rerouteArrows, layoutFromElements, colourFor } from './graphToScene.js'
+import {
+  graphToElements, applyFocus, rerouteArrows, layoutFromElements, colourFor, FONT,
+  reshaped, routeFromEdit
+} from './graphToScene.js'
+
+const absPoints = el => el.points.map(([px, py]) => [el.x + px, el.y + py])
+
+// A box as it is on screen right now, which is ahead of the graph mid-drag.
+const rectOf = (elements, nodeId) => {
+  const r = elements.find(e => e.type === 'rectangle' && e.customData?.nodeId === nodeId && !e.isDeleted)
+  return r ? { x: r.x, y: r.y, w: r.width, h: r.height } : null
+}
+const boxesOf = elements => elements
+  .filter(e => e.type === 'rectangle' && e.customData?.nodeId && !e.isDeleted)
+  .map(e => ({ x: e.x, y: e.y, w: e.width, h: e.height }))
 
 export default function Canvas ({
   graph, selection, onSelect, onLayout,
-  onAddEdge, onRelabel, onRelink, onRecolour, onAddComponent,
+  onAddEdge, onRelabel, onRelink, onRecolour, onAddComponent, onReroute,
   layoutNonce, locked
 }) {
   const [api, setApi] = useState(null)
@@ -19,6 +33,28 @@ export default function Canvas ({
   // re-seeded yet. Without this, resetting a colour is undone by the next change
   // event, which still carries the old element and reads as "they picked that".
   const drawn = useRef(new Map())
+  // The same idea for arrows: the path we last put on screen, per edge, absolute.
+  // A reshape is told apart from Excalidraw moving an arrow's ends with its box by
+  // comparing against this, not against the graph.
+  const drawnPaths = useRef(new Map())
+  // Routes captured from a reshape that the graph has not caught up with: edge id
+  // -> { route, settled }. Re-routing uses them meanwhile, or the arrow would snap
+  // back to its old shape first. One stays until the graph holding it has rendered,
+  // not just until the server answers - a reroute timer set before the save fired
+  // in that gap and drew the old shape back over a deleted bend.
+  const pending = useRef(new Map())
+  // The latest graph, for timers: one set by an earlier change event still holds
+  // the graph from then.
+  const graphRef = useRef(graph)
+  graphRef.current = graph
+  const remember = elements => {
+    for (const el of elements) {
+      if (el.customData?.edgeId && el.points) drawnPaths.current.set(el.customData.edgeId, absPoints(el))
+    }
+  }
+  const withPending = g => (pending.current.size
+    ? { ...g, edges: g.edges.map(e => (pending.current.has(e.id) ? { ...e, route: pending.current.get(e.id).route } : e)) }
+    : g)
   // Structure version: only re-seed the scene when nodes/edges change, so the
   // agent's patches land without stomping on a drag the user is mid-way through.
   // Focus is deliberately NOT in here. Re-seeding replaces every element, which
@@ -47,15 +83,32 @@ export default function Canvas ({
     // as "user deselected", losing the focus. Put the selection back in the same
     // call.
     drawn.current = new Map(graph.nodes.map(n => [n.id, colourFor(n)]))
+    const elements = graphToElements(withPending(graph), selection)
     api.updateScene({
-      elements: graphToElements(graph, selection),
+      elements,
       appState: {
         selectedElementIds: selection
           ? { [`${selection.kind}:${selection.id}`]: true }
           : {}
       }
     })
+    remember(elements)
   }, [api, structure, layoutNonce])
+
+  // A route changed - reshaped here, reset from the panel, or set by an Arrange
+  // turn. That is geometry on arrows only, so it is redrawn in place like a box
+  // move, not by a re-seed.
+  const routes = JSON.stringify(graph ? graph.edges.map(e => [e.id, e.route ?? null]) : null)
+  useEffect(() => {
+    if (!api || !graph) return
+    // Any saved route is in this graph now, so it stops overriding it.
+    for (const [id, p] of pending.current) if (p.settled) pending.current.delete(id)
+    const { elements, changed } = rerouteArrows(api.getSceneElements(), withPending(graph))
+    if (!changed) return
+    seedingUntil.current = Math.max(seedingUntil.current, Date.now() + 300)
+    api.updateScene({ elements })
+    remember(elements)
+  }, [api, routes])
 
   // Focus on its own only changes opacity, so recolour the scene that is already
   // there. No geometry is touched, nothing snaps back, and no settle window is
@@ -73,6 +126,74 @@ export default function Canvas ({
     clearTimeout(timer.current)
     clearTimeout(routeTimer.current)
   }, [])
+
+  // Several change events follow one pointer-up, each rebuilding the same route.
+  // Compare by content: a fresh copy replacing the pending one left it pending for
+  // good, and a later reset was drawn straight over. False when nothing changed.
+  const saveRoute = (edge, route) => {
+    const known = pending.current.get(edge.id)?.route ?? edge.route ?? null
+    if (JSON.stringify(known) === JSON.stringify(route)) return false
+    const entry = { route, settled: false }
+    pending.current.set(edge.id, entry)
+    Promise.resolve(onReroute?.(edge.id, route)).then(
+      () => { entry.settled = true },
+      // Never saved, so nothing will catch it up: let the old shape come back.
+      () => { if (pending.current.get(edge.id) === entry) pending.current.delete(edge.id) }
+    )
+    return true
+  }
+
+  // Where the last click on the canvas landed, in scene units. Clicking a bend's
+  // handle does not select that point - Excalidraw only does that in its line editor
+  // (Ctrl+Enter) - so this is how Delete knows which bend was meant.
+  const lastDown = useRef(null)
+  const noteDown = e => {
+    if (!api) return
+    const box = e.currentTarget.getBoundingClientRect()
+    const { scrollX, scrollY, zoom } = api.getAppState()
+    lastDown.current = viewportCoordsToSceneCoords(
+      { clientX: e.clientX, clientY: e.clientY },
+      { zoom, scrollX, scrollY, offsetLeft: box.left, offsetTop: box.top }
+    )
+  }
+
+  // Click a bend, press Delete: the bend goes. Without this Delete fell through to
+  // the whole arrow, which the canvas refuses to delete, so nothing happened at all
+  // and bends could only ever be added. Caught ahead of Excalidraw, like Ctrl+Z.
+  useEffect(() => {
+    if (!api || !graph || locked) return
+    const onKey = e => {
+      if (e.key !== 'Delete' && e.key !== 'Backspace') return
+      const t = e.target
+      if (t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+      const appState = api.getAppState()
+      // Inside its own line editor Excalidraw deletes the selected point itself, and
+      // handleChange squares up what is left.
+      if (appState.editingLinearElement) return
+      const ids = Object.keys(appState.selectedElementIds ?? {})
+      if (ids.length !== 1) return
+      const elements = api.getSceneElements()
+      const el = elements.find(x => x.id === ids[0])
+      const edge = el?.type === 'arrow' && graph.edges.find(x => x.id === el.customData?.edgeId)
+      const at = lastDown.current
+      if (!edge || !at) return
+      const now = absPoints(el)
+      const reach = 12 / appState.zoom.value
+      const k = now.findIndex((p, i) => i > 0 && i < now.length - 1 && Math.hypot(p[0] - at.x, p[1] - at.y) <= reach)
+      if (k === -1) return
+      e.preventDefault()
+      e.stopPropagation()
+      const [a, b] = [rectOf(elements, edge.from), rectOf(elements, edge.to)]
+      if (!saveRoute(edge, routeFromEdit(now.filter((_, i) => i !== k), a, b, boxesOf(elements), now))) return
+      const { elements: routed, changed } = rerouteArrows(api.getSceneElements(), withPending(graph))
+      if (!changed) return
+      seedingUntil.current = Math.max(seedingUntil.current, Date.now() + 300)
+      api.updateScene({ elements: routed })
+      remember(routed)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [api, graph, locked])
 
   const handleChange = (elements, appState) => {
     if (Date.now() < seedingUntil.current) return
@@ -157,7 +278,21 @@ export default function Canvas ({
           const to = nodeOf(el.endBinding?.elementId)
           if (from && to && from !== to && (from !== edge.from || to !== edge.to)) {
             once(`relink:${edgeId}:${from}->${to}`, () => onRelink?.(edgeId, from, to))
+            continue
           }
+
+          // Reshaped by hand. Only an arrow the user has hold of - dragging a box
+          // moves its arrows' ends too - and only once the pointer is up, or every
+          // frame of the drag would be saved.
+          const held = appState.selectedElementIds?.[el.id] ||
+            appState.selectedLinearElement?.elementId === el.id ||
+            appState.editingLinearElement?.elementId === el.id
+          if (!held || appState.cursorButton !== 'up' || from !== edge.from || to !== edge.to) continue
+          const now = absPoints(el)
+          const before = drawnPaths.current.get(edgeId)
+          const [a, b] = [rectOf(elements, from), rectOf(elements, to)]
+          if (!reshaped(before, now, a, b)) continue
+          saveRoute(edge, routeFromEdit(now, a, b, boxesOf(elements), before))
         }
       }
     }
@@ -171,7 +306,9 @@ export default function Canvas ({
     if (graph && (nodesOnScreen < graph.nodes.length || edgesOnScreen < edgesExpected)) {
       submitted.current.clear()
       seedingUntil.current = Date.now() + 600
-      api.updateScene({ elements: graphToElements(graph, selection) })
+      const restored = graphToElements(withPending(graph), selection)
+      api.updateScene({ elements: restored })
+      remember(restored)
       return
     }
 
@@ -193,15 +330,22 @@ export default function Canvas ({
     // a bound arrow's endpoints from the moved box while keeping our points, so the
     // leg between box edge and path shows as a diagonal until the path is rebuilt.
     // Saving stays on the slower beat so a drag is written once, not per frame.
+    // Not while an arrow is being dragged, though: re-routing it mid-drag is what
+    // used to snap a reshaped arrow straight back. Pointer-up picks it up.
     clearTimeout(routeTimer.current)
-    routeTimer.current = setTimeout(() => {
-      const { elements: routed, changed } = rerouteArrows(api.getSceneElements(), graph)
-      if (!changed) return
-      // Short guard: this updateScene echoes back through onChange, and without it
-      // the echo schedules another save and another re-route.
-      seedingUntil.current = Date.now() + 300
-      api.updateScene({ elements: routed })
-    }, 220)
+    const draggingArrow = appState.cursorButton === 'down' &&
+      (appState.selectedLinearElement || appState.editingLinearElement)
+    if (!draggingArrow) {
+      routeTimer.current = setTimeout(() => {
+        const { elements: routed, changed } = rerouteArrows(api.getSceneElements(), withPending(graphRef.current))
+        if (!changed) return
+        // Short guard: this updateScene echoes back through onChange, and without it
+        // the echo schedules another save and another re-route.
+        seedingUntil.current = Date.now() + 300
+        api.updateScene({ elements: routed })
+        remember(routed)
+      }, 220)
+    }
 
     clearTimeout(timer.current)
     timer.current = setTimeout(() => onLayout(layoutFromElements(elements)), 900)
@@ -244,7 +388,7 @@ export default function Canvas ({
   }
 
   return (
-    <div className="canvas" onPointerDownCapture={pickWhileLocked}>
+    <div className="canvas" onPointerDownCapture={e => { noteDown(e); pickWhileLocked(e) }}>
       <Excalidraw
         // Visible and pannable during a turn, but not editable: the agent is
         // writing to the same graph, and a drag saved mid-write would race it.
@@ -253,8 +397,9 @@ export default function Canvas ({
         onChange={handleChange}
         // Seeded, not controlled: Excalidraw owns the theme from here, so its own
         // menu can still toggle it. Dark inverts the canvas, so a white background
-        // is what renders as near-black and matches the chat pane.
-        initialData={{ appState: { theme: 'dark', viewBackgroundColor: '#ffffff' } }}
+        // is what renders as near-black and matches the chat pane. Text typed on
+        // the canvas starts in the diagram's font, so a new box matches the rest.
+        initialData={{ appState: { theme: 'dark', viewBackgroundColor: '#ffffff', currentItemFontFamily: FONT } }}
       />
     </div>
   )

@@ -24,11 +24,19 @@ user marks them reviewed — that is their review surface, instead of reading ev
   absent means "follow the kind", so changing kind still recolours an untouched box.
   `colourFor()` is the one place that resolves it: touched wins, then the override, then
   the kind.
+- **An arrow's shape is layout too, and the user's alone.** `edge.route` - `{ from, to,
+  via }`, the side of each box it attaches to and the bends it passes through - is set by
+  dragging. The agent cannot route: `applyPatch` drops `route` off incoming edges, and
+  `set_layout` has no routes. Changing an edge's ends drops its route, since the bends
+  were for the old ends, and an Arrange turn clears every route, since a fresh layout
+  makes them all stale. Bends are absolute and stay put when a box moves; the ends
+  re-attach to their side.
 - **Layout** (x/y/w/h) is the user's, by dragging. This is enforced, not just asked for:
   `applyPatch` in `server/graph.mjs` strips x/y/w/h off every incoming patch. The one
   exception is deliberate and contained: the **Arrange with AI** button runs a turn with
-  a fourth tool, `set_layout`, which writes positions and nothing else. It exists only on
-  that turn - `createCanvasServer(dir, diagram, { layout: true })` - so an ordinary turn
+  a fourth tool, `set_layout`, which takes a grid cell per box and nothing else -
+  `placeCells` in `server/layout.mjs` turns cells into pixels. It exists only on that
+  turn - `createCanvasServer(dir, diagram, { layout: true })` - so an ordinary turn
   still cannot move a box.
 - **The canvas is a real editor, but it still never writes `graph.json` itself.** Drawing
   a box or an arrow, renaming either in place, and dragging an arrow's end onto another
@@ -72,17 +80,22 @@ server/index.mjs       Express + Agent SDK, SSE stream, all routes
 server/workspaces.mjs  ~/.promptcanvas/workspaces.json — the repo list, the only
                        state outside the projects it drives. Atomic writes + .bak.
 server/graph.mjs       per-workspace, per-diagram read/write, applyPatch, free-slot
-                       auto-placement, PR-friendly serialisation. Diagram names are
-                       validated here: they become file names.
+                       auto-placement, PR-friendly serialisation (a bend point is one
+                       [x, y] line). cleanRoute validates an arrow's route. Diagram
+                       names are validated here: they become file names.
 server/tools.mjs       in-process MCP server: get_graph, get_node, patch_graph, and
-                       set_layout on an Arrange turn only. Built per turn, taking a
-                       function for the diagram name and an onWrite callback.
+                       set_layout (a grid cell per box) on an Arrange turn only. Built
+                       per turn, taking a function for the diagram name and an
+                       onWrite callback.
+server/layout.mjs      placeCells: Arrange's cells -> pixels, every column and row gap
+                       sized to the arrow labels that will sit in it.
 server/scan.mjs        evidence-based repo scanner (no LLM, no network). Reads
                        compose image/build context/environment/command/depends_on,
                        and resolves declared commands to the file that runs them.
 server/pickFolder.mjs  native OS folder dialog, spawned server-side
 web/src/App.jsx        state, loading, layout/structure wiring, the drag-to-resize
-                       divider, and the view-main / promote-to-main pair
+                       divider, the view-main / promote-to-main pair, and Clear
+                       canvas with its Ctrl+Z undo
 web/src/main.jsx       entry point
 web/src/Nav.jsx        workspace and session dropdowns
 web/src/styles.css     every style; one shared rule covers all three pickers
@@ -95,8 +108,9 @@ web/src/Canvas.jsx     Excalidraw, re-seeds on structure change, debounced layou
                        save, view-mode while a turn is running
 web/src/graphToScene.js graph.json -> Excalidraw elements. routeAll() routes every
                        arrow orthogonally, fans out edges sharing a box face and
-                       keeps parallel runs apart; plus focus dimming and the
-                       crossingCount metric the arrange prompt quotes
+                       keeps parallel runs apart; hand routes are drawn by
+                       handRoute() and read back off a drag by routeFromEdit();
+                       plus focus dimming
 web/src/Inspector.jsx  edit a node's label, kind, owned folders, notes; delete it
                        (two-step, and the server drops its edges with it). Also
                        exports EdgePanel: what a selected connection joins, and
@@ -155,9 +169,27 @@ web/src/ScanPanel.jsx  scan preview with Replace / Merge, and the option to hand
   invisible and unclickable underneath them.
 - **`allowedTools` is auto-approve, not a restriction** (use `tools` to restrict). With no
   `canUseTool`, a tool outside the list has nothing to ask and the stream just stalls
-  silently — hence the explicit deny-with-a-message callback.
+  silently — hence the explicit deny-with-a-message callback. The chat route passes
+  `tools` too: without it the preset offers ~30 tools (PowerShell, web search, cron,
+  workflows, plus whatever the user's own Claude Code setup adds), each one a
+  definition in every call's prompt, and a bab-lc turn spent two round trips on
+  PowerShell before being refused.
+- **The canvas MCP server is `alwaysLoad: true`.** Otherwise its tools sit behind tool
+  search and every turn opens with a `ToolSearch` call just to find `get_graph`.
 - **`systemPrompt: { type: 'preset', preset: 'claude_code', append }` is correct** as of
-  SDK 0.3.269. Verified, don't "fix" it.
+  SDK 0.3.286 (accepted at `init`; first verified on 0.3.269). Don't "fix" it.
+- **Tool schema fields are `.optional()`, never `.default()`.** The SDK rejects a call
+  that leaves out a field with a default ("expected nonoptional"), even though the JSON
+  Schema advertises the default. A bab-lc overview turn had its first 28-node
+  `patch_graph` thrown back for omitting the remove lists and sent again in full: 8.6k
+  output tokens, a fifth of the turn's $1.23. `applyPatch` and the handlers fill the gaps.
+- **You can check what a query will run without paying for it.** The `system`/`init`
+  message carries the resolved model and the full tool list, and arrives before any API
+  call. Point `ANTHROPIC_BASE_URL` at a closed local port with a fake key, read `init`,
+  abort - nothing reaches a billed endpoint. That is how the next two were found. The
+  same trick runs a whole second PromptCanvas safely: its own `PROMPTCANVAS_HOME`,
+  `PROJECT_DIR`, ports and that dead base URL, so `/api/chat` can be driven end to end
+  for nothing - turns start, report `init`, and fail to reach the API.
 - **Excalidraw fetches element fonts from esm.sh by default.** `web/index.html` sets
   `EXCALIDRAW_ASSET_PATH` and a plugin in `vite.config.js` serves them locally. The CDN
   URL is hardcoded as a last-resort `src` fallback and cannot be removed; it serves no
@@ -218,16 +250,39 @@ web/src/ScanPanel.jsx  scan preview with Replace / Merge, and the option to hand
   holds one `model` for the whole tool (`opus`/`sonnet`/`haiku`, or empty for the SDK
   default) and it goes into `query` options. What the UI shows is `message.model` from
   the `init` message - the id the SDK actually resolved to - so the label is never the
-  source of truth.
+  source of truth. The alias resolves inside the Claude Code the SDK bundles, so it only
+  moves when the SDK does: on 0.3.269 "opus" was still Opus 5 ($5/$25 per MTok), on
+  0.3.286 it is Opus 5.5 ($4/$20). Upgrading the SDK is how the tool gets a newer model.
 - **`modelUsage` is the field for token accounting, not `usage`.** The SDK says so in
   its own docs: `usage` is the main loop only, while `modelUsage` covers subagents and
   internal calls, and carries `costUSD` per model. `total_cost_usd` is the running total
   for the query. All estimates, not a bill.
 - **An agent asked to re-arrange a diagram hands back the layout it was given.** The
   first `Arrange with AI` run returned positions identical to the existing ones for all
-  34 boxes - while describing placement it had not done, so the prose is no evidence. It
-  cannot see the canvas, so the prompt has to say the current layout is the problem,
-  quantify it (`crossingCount`), and tell it explicitly to ignore the current x/y.
+  34 boxes - while describing placement it had not done, so the prose is no evidence. The
+  prompt tells it not to start from the current positions. Do not dress that up as "the
+  diagram is unreadable" with a measured figure: with 0 of 47 arrows through a box, a
+  bab-lc prompt contradicted itself and the agent said so.
+- **Arrange was slow from reasoning about pixels, not from writing them.** A bab-lc turn
+  took 204 s: 187 s in one call that produced 19.7k output tokens and a `set_layout` of
+  ~800. Hence cells: the agent decides who sits next to whom, `placeCells` does the
+  arithmetic. The turn also ran resumed, dragging 82.7k tokens of an earlier repo
+  exploration into a layout job, so it now runs with `persistSession: false` and no
+  `resume` - which means it skips every bit of session bookkeeping in the chat route
+  (no `session` event, no new diagram, no active-session change) and is gone from the
+  transcript after a reload.
+- **Arrow labels need room, and the agent will not leave it.** Its own bab-lc layout put
+  boxes 120 px apart and 17 of 47 labels on a box; the user's hand correction had none,
+  with a median 434 px between connected boxes. `placeCells` sizes each column gap to
+  the widest label crossing it (capped where Excalidraw wraps an arrow label, ~154 px,
+  plus 70 px air) and each row gap to the tallest. Run either layout's cells through it
+  and labels on a box drop to 0-2.
+- **An exact grid needs lanes between rows, not just round the outside.** Boxes in a row
+  share a line, so a corridor's legs run through the neighbours in between, and with
+  only the two outer lanes every long arrow took the same one: 12 arrows drawn on top of
+  each other. `routeAll` now offers a lane through every row/column gap, a track either
+  side of its middle, and records each lane's extent on the right axis - it used the
+  span across the lane, so lanes never really kept apart. Overlaps 12 -> 0.
 - **Sessions are keyed by project directory**, so moving a repo orphans its history.
 - **Editing `.env` does not restart the server.** `node --watch` only watches imported
   modules, so restart `npm run dev` by hand after touching it.
@@ -261,6 +316,40 @@ web/src/ScanPanel.jsx  scan preview with Replace / Merge, and the option to hand
 - **`locked` means read-only everywhere, not just the canvas.** The Inspector's Save is
   disabled by the same flag - otherwise you can edit a node's paths while the agent is
   writing the same graph, or write the session's graph while main is on screen.
+- **Ctrl+Z after a clear is caught on `window` in the capture phase**, ahead of Excalidraw,
+  which listens on its own container. Its history knows nothing about `graph.json`, so
+  letting it through would bring back boxes the graph no longer has. Inputs and
+  textareas are skipped so typing keeps its own undo. Undo is a PUT of the graph the
+  clear route handed back, and it expires as soon as the diagram is not empty.
+- **Reshaped arrows snapped back because the 220 ms re-route ran mid-drag** and rebuilt
+  the path from the graph, which had no shape for it. Re-routing now waits while an arrow
+  is held with the pointer down, and a reshape is captured on pointer-up, only for an
+  arrow the user has selected - a box drag moves its arrows' ends too, and Excalidraw
+  nudges bound ends by a pixel on its own. It is compared against `drawnPaths`, what we
+  last put on screen, never against the graph.
+- **A pending route is compared by content, not identity.** One pointer-up fires several
+  change events, each rebuilding an equal route object. Replacing the pending one by
+  identity left it pending for good, and every later reset was drawn straight over.
+- **A pending route stays until the graph holding it has rendered**, not until the server
+  answers. A reroute timer set by an earlier change event fired in that gap, with the
+  graph from before, and drew a deleted bend straight back. Timers read `graphRef`.
+- **Clicking a bend's handle does not select that point.** Excalidraw only selects points
+  in its line editor (Ctrl+Enter), so Delete went to the whole arrow, the canvas refused
+  to delete it, and nothing happened - bends could be added by dragging but never
+  removed. `Canvas` notes where the last click landed and, with one of our arrows
+  selected, turns Delete near a bend into removing that bend. A deleted bend takes its
+  partner corner with it, or squaring up puts the same corner back.
+- **A dragged corner has to take both its segments with it.** Squaring up the raw drag
+  alone let the untouched neighbour pin one segment, so a diagonal drag only half landed.
+  `routeFromEdit` gets the path as drawn before, and slides the neighbours along.
+- **Each end of a hand route is a set of ports, tried in every combination.** Deciding
+  how to leave a box before knowing where the route was headed went round the wrong end
+  of the box, or doubled back through it. Measured on ~4400 random routes: none off
+  square, none leaving or entering its box sideways, and redrawing a stored route gives
+  the same path apart from a handful of degenerate bends.
+- **`saveLayout` reads the latest graph through `graphRef`.** It runs on a 900 ms timer,
+  and a closure over `graph` wrote back the copy from before a reshape saved in between,
+  wiping the route.
 - **Focus must NOT be in the canvas re-seed key**, even though dimming lives in element
   opacity. Putting it there cost two bugs at once: clicking a box re-seeded the whole
   scene just as the drag began, so the label visibly lagged its box, and the 1200 ms
@@ -286,16 +375,23 @@ session's own `.promptcanvas/graphs/<name>.json`, and activating that session br
 back. Nothing in the UI picks one; the bar shows which diagram the session owns.
 
 **The canvas is a full editor.** Draw a box or an arrow, rename either in place, drag an
-arrow's end onto another box, recolour a box, drag and resize - every one of those goes
+arrow's end onto another box, reshape an arrow by dragging its bends, removing one (click
+it, press Delete) or moving its end to another side of its box (the edge panel's **Reset
+route** undoes all of that), recolour a box,
+drag and resize - every one of those goes
 through the same server routes the agent's patch uses, so `graph.json` has one writer.
 Deleting is the deliberate exception: the canvas puts it straight back, and deletion is
-done from the inspector, which confirms first. Also:
+done from the inspector, which confirms first. **Clear canvas** in the bar empties the
+whole session diagram behind a warning, and Ctrl+Z (or **undo clear**) restores it until
+anything else lands on the diagram. It refuses main, server-side too. Also:
 - *Orthogonal routing* - every arrow is right-angled, edges sharing a box face are fanned
   out, and parallel runs are kept apart. No diagonals.
 - *Focus* - selecting a box dims everything more than one hop away.
 - *Live updates* - `patch_graph`/`set_layout` writes stream to the canvas mid-turn, and
   the canvas goes read-only (`viewModeEnabled`) while a turn runs.
-- *Arrange with AI* - a turn with `set_layout`, the only thing that moves boxes.
+- *Arrange with AI* - a turn with `set_layout`, the only thing that moves boxes. The
+  agent picks a grid cell per box, the server spaces them for the arrow labels, and
+  every hand route is cleared. It runs without the session's conversation.
 
 **Scanning.** `Scan repo` reads compose image/build-context/environment/command/
 depends_on and resolves declared commands to the file that runs them; the panel offers to
@@ -319,9 +415,11 @@ only route from session work back to the map other developers get.
 
 ## Next
 
-1. **Make `set_layout` cheaper to call.** Emitting 34 JSON position objects took a turn
-   about eight minutes of pure generation. A compact form (`id:x,y; id:x,y`) or coarse
-   cluster coordinates the server expands would cut that a lot.
+1. **Measure a real Arrange turn with cells.** Everything about it is verified except a
+   paid run: time, cost, and whether the agent's cells reproduce what the user did by
+   hand on bab-lc (connected neighbours 21/28, labels clear 46/47, regions per
+   subsystem). The bab-lc snapshots and the measuring scripts were scratch work; the
+   numbers to beat are in the gotchas above.
 2. **Make an empty scan explain itself** - see the gaps below.
 3. **Adding a connection has no form.** Drawing one on the canvas works, and so does the
    agent, but there is no equivalent of `+ component` for an edge.
@@ -333,11 +431,13 @@ only route from session work back to the map other developers get.
   is `web/src`, so `realPaths` comes back empty and the branch emits neither a node nor a
   `detected` line — you get `{nodes:[],edges:[],detected:[]}` with no explanation.
   PromptCanvas cannot scan itself. An empty scan should still report what it looked at.
-- **`patch_graph`'s array arguments are not really optional.** They are declared
-  `z.array(...).default([])`, and the JSON Schema says `"default": []`, but validation
-  rejects a call that omits them - two separate agents hit this and had to resend with
-  explicit empty arrays, wasting a call each time. `.optional().default([])` in the Zod
-  shape is the likely fix.
+- **Hand routes keep bends and sides, not where along a side an end sits.** Sliding an
+  arrow's end along the same side of its box changes nothing stored; it snaps to wherever
+  on that side lines up with its route.
+- **Hand routes only dodge boxes between bends by picking the other corner.** A route
+  whose bends force a line through a box still goes through it - the user put them
+  there. A lone bend exactly in line with both ends but behind a box collapses into the
+  straight line.
 - **The 5px line-separation rule is not fully met.** Within a box the fan-out guarantees
   it, but two horizontal stubs from *different* boxes whose anchors happen to land near
   the same y can still come out 3-4px apart - two pairs out of ~190 segments on bab-lc.

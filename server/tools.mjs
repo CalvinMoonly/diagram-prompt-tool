@@ -1,6 +1,7 @@
 import { tool, createSdkMcpServer } from '@anthropic-ai/claude-agent-sdk'
 import { z } from 'zod'
 import { readGraph, writeGraph, applyPatch, KINDS } from './graph.mjs'
+import { placeCells } from './layout.mjs'
 
 // The canvas is the agent's map of the system. It reads meaning from here,
 // never from pixels: every node carries the folders it owns.
@@ -29,7 +30,7 @@ function summarise (graph) {
     .map(n => `  ${n.id} "${n.label}" [${n.kind}] <- ${n.paths.join(', ') || 'no paths'}`)
     .join('\n')
   const edges = graph.edges
-    .map(e => `  ${e.from} -> ${e.to}${e.label ? ` (${e.label})` : ''}`)
+    .map(e => `  ${e.from} -> ${e.to}${e.label ? ` (${e.label})` : ''}${e.route ? ' [hand-routed]' : ''}`)
     .join('\n')
   return `nodes:\n${nodes || '  (none)'}\nedges:\n${edges || '  (none)'}`
 }
@@ -87,12 +88,16 @@ function buildTools (dir, activeDiagram, { layout = false, onWrite } = {}) {
   const patchGraph = tool(
     'patch_graph',
     'Update the architecture graph after you change the shape of the system: add or edit nodes and edges, remove ones that no longer exist. Call this in the SAME turn as the code change, never as a separate follow-up. Do not set positions; the canvas owns layout.',
+    // .optional(), never .default(): the SDK rejects a call that leaves out a field
+    // with a default. A first patch_graph of a 28-node diagram was thrown back for
+    // omitting the remove lists and sent again in full - 8.6k output tokens, a fifth
+    // of that turn's cost. applyPatch and the handler fill in the gaps.
     {
-      upsertNodes: z.array(nodeShape).default([]),
-      removeNodeIds: z.array(z.string()).default([]),
-      upsertEdges: z.array(edgeShape).default([]),
-      removeEdgeIds: z.array(z.string()).default([]),
-      why: z.string().default('').describe('One sentence: what changed in the system and why the diagram moved with it')
+      upsertNodes: z.array(nodeShape).optional(),
+      removeNodeIds: z.array(z.string()).optional(),
+      upsertEdges: z.array(edgeShape).optional(),
+      removeEdgeIds: z.array(z.string()).optional(),
+      why: z.string().optional().describe('One sentence: what changed in the system and why the diagram moved with it')
     },
     async (args) => {
       const current = await readGraph(dir, diagram())
@@ -109,36 +114,39 @@ function buildTools (dir, activeDiagram, { layout = false, onWrite } = {}) {
     }
   )
 
-  // Positions only, and only handed to the agent on a turn the user started from
+  // Layout only, and only handed to the agent on a turn the user started from
   // "Arrange with AI". Every other turn gets the three tools above, so layout stays
-  // the user's exactly as before.
+  // the user's exactly as before. The agent picks cells; placeCells turns them into
+  // pixels with every gap sized to the arrow labels in it - see server/layout.mjs.
   const setLayout = tool(
     'set_layout',
-    'Move boxes on the canvas. Positions only: this cannot add, remove, rename or re-link anything. Coordinates are the top-left corner of a box in canvas units, x rightwards and y downwards. Boxes are 220 wide and 90 tall unless the graph says otherwise.',
+    'Lay the whole diagram out on a grid: give every box a column and a row (0 is the leftmost column and the top row). The server turns cells into pixels and makes every gap wide enough for the labels on the arrows crossing it, so think in cells, not pixels. Boxes in the same row or column line up exactly, so an arrow between neighbours there is straight. A column or row left empty becomes an aisle between regions. One box per cell, and every box needs one, or nothing moves. This replaces the whole layout and clears hand-drawn arrow routes; arrows route themselves.',
     {
-      positions: z.array(z.object({
+      cells: z.array(z.object({
         id: z.string().describe('Node id'),
-        x: z.number(),
-        y: z.number()
-      })).describe('Where each box should sit. Nodes you leave out keep their current position.'),
-      why: z.string().default('').describe('One sentence: how you arranged it')
+        col: z.number().int().min(0).max(60),
+        row: z.number().int().min(0).max(60)
+      })).describe('A cell for every box.'),
+      // Optional without a default, like patch_graph's fields above.
+      why: z.string().optional().describe('One sentence: how you arranged it')
     },
     async (args) => {
       const graph = await readGraph(dir, diagram())
-      const moved = new Map(args.positions.map(p => [p.id, p]))
-      const unknown = args.positions.filter(p => !graph.nodes.some(n => n.id === p.id)).map(p => p.id)
-      const nodes = graph.nodes.map(n => (
-        moved.has(n.id)
-          ? { ...n, x: Math.round(moved.get(n.id).x), y: Math.round(moved.get(n.id).y) }
-          : n
-      ))
-      const saved = await writeGraph(dir, diagram(), { ...graph, nodes })
+      const placed = placeCells(graph, args.cells)
+      if (placed.error) return { content: [{ type: 'text', text: placed.error }], isError: true }
+      const nodes = graph.nodes.map(n => ({ ...n, ...placed.positions.get(n.id) }))
+      // A fresh layout makes every hand route stale: bends stay where they were put,
+      // so ones drawn round the old layout cut straight through the new one.
+      const cleared = graph.edges.filter(e => e.route).length
+      const edges = graph.edges.map(({ route, ...e }) => e)
+      const saved = await writeGraph(dir, diagram(), { ...graph, nodes, edges })
       onWrite?.(saved)
       return {
         content: [{
           type: 'text',
-          text: `Moved ${args.positions.length - unknown.length} of ${saved.nodes.length} boxes${args.why ? `: ${args.why}` : ''}.` +
-            (unknown.length ? ` Unknown ids ignored: ${unknown.join(', ')}.` : '')
+          text: `Placed ${saved.nodes.length} boxes on a ${placed.cols} x ${placed.rows} grid${args.why ? `: ${args.why}` : ''}.` +
+            (cleared ? ` Cleared ${cleared} hand-drawn routes.` : '') +
+            (placed.unknown.length ? ` Unknown ids ignored: ${placed.unknown.join(', ')}.` : '')
         }],
         structuredContent: { graph: saved }
       }
@@ -150,9 +158,12 @@ function buildTools (dir, activeDiagram, { layout = false, onWrite } = {}) {
 
 // Built per turn with the workspace dir AND the diagram it is working on closed
 // over, so the agent can only touch the one the user is looking at.
+// alwaysLoad: these are the tools every turn is about, so they go in the prompt up
+// front. Deferred behind tool search, a turn opened with a ToolSearch round trip
+// just to find get_graph.
 export function createCanvasServer (dir, activeDiagram, opts) {
   return createSdkMcpServer({
-    name: 'canvas', version: '0.1.0', tools: buildTools(dir, activeDiagram, opts)
+    name: 'canvas', version: '0.1.0', alwaysLoad: true, tools: buildTools(dir, activeDiagram, opts)
   })
 }
 

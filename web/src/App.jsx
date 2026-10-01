@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react'
 import Canvas from './Canvas.jsx'
-import { crossingCount } from './graphToScene.js'
 import Chat, { clock } from './Chat.jsx'
 import Inspector, { EdgePanel } from './Inspector.jsx'
 import Nav from './Nav.jsx'
@@ -31,32 +30,40 @@ const refinePrompt = detected => [
   detected.join('\n')
 ].join('\n')
 
-// What the agent is asked when you press "Arrange with AI". Deliberately not a
-// grid: grouping by meaning is what makes a diagram readable, and a tidy grid that
-// ignores the arrows is what we already have offline.
-// What the agent is asked when you press "Arrange with AI". It cannot see the
-// canvas, so the prompt has to say what is wrong in numbers - and say plainly that
-// the current positions are the problem, or it reads them as a layout to preserve
-// and hands the same thing back.
-const arrangePrompt = ({ hits, counted }) => [
-  'This diagram is unreadable and needs laying out again from scratch.',
-  `Right now ${hits} of its ${counted} arrows run straight through a box that is not`,
-  'either end of that arrow, which is what makes it unreadable.',
+// What the agent is asked when you press "Arrange with AI". It picks a grid cell
+// per box and the server does the pixels (server/layout.mjs), so the prompt is about
+// who sits next to whom - the part that needs judgement. The rules come from a
+// bab-lc layout the user corrected by hand: the agent's own had boxes 120px apart
+// with 17 of 47 arrow labels on a box, and connected boxes far apart (11 of 28 had a
+// neighbour they talk to as their nearest box; the user's version, 21). Spacing for
+// labels is now the server's job; locality and regions are the prompt's.
+const ARRANGE_PROMPT = [
+  'Lay this diagram out again from scratch, on a grid. Call get_graph, then call',
+  'set_layout once with a column and a row for every box. Do not start from the',
+  'current positions.',
   '',
-  'Ignore the current x/y completely - do not treat them as a starting point, and do',
-  'not hand back positions close to the ones you were given. Call get_graph, decide',
-  'placement from the edges alone, then call set_layout with every box.',
+  'You only choose cells. The server turns them into pixels and makes every gap wide',
+  'enough for the labels on the arrows crossing it, so do not reason about pixels or',
+  'spacing - only about which box sits next to which.',
   '',
-  '- Group boxes that talk to each other, and let the arrows run mostly one way so',
-  '  the shape shows: what feeds what, and where the ends are.',
-  '- Leave clear lanes between groups for arrows to travel down. Coordinates are the',
-  '  top-left corner; boxes are 220 wide and 90 tall unless the graph says otherwise.',
-  '- Nothing may overlap. It does not have to be a grid, and it should not be an even',
-  '  one: uneven spacing that groups by meaning is what makes it readable.',
+  '- Put every box next to a box it talks to: connected boxes in neighbouring cells,',
+  '  in the same row or the same column where you can. The arrow between them is',
+  '  then straight, with its label in the gap.',
+  '- Give each subsystem its own region - for example ingest, web and billing,',
+  '  background workers, data stores. A chain of boxes that only talk along the chain',
+  '  goes in a straight line, across a row or down a column. Leave an empty row or',
+  '  column between regions as an aisle.',
+  '- The busiest boxes go in the middle of what they connect to, not at an edge.',
+  '- Let the arrows mostly run one way, from what feeds into what: top-left towards',
+  '  bottom-right.',
+  '- Keep it wider than tall: about half as many rows as columns.',
   '',
-  'Positions only. Do not add, remove, rename or re-link anything, and do not edit',
-  'files. Keep your reply to a couple of lines - the diagram is the output.'
+  'Layout only: do not add, remove, rename or re-link anything, do not edit files,',
+  'and do not route arrows - they route themselves. Reply in a couple of lines.'
 ].join('\n')
+
+const UNDO_KEYS = /Mac|iPhone|iPad/.test(navigator.platform) ? '⌘Z' : 'Ctrl+Z'
+const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 const post = (url, body) => json(url, {
   method: 'POST',
@@ -71,6 +78,8 @@ export default function App () {
   const [activeSessionId, setActiveSessionId] = useState(null)
 
   const [graph, setGraph] = useState(null)
+  const graphRef = useRef(null)
+  graphRef.current = graph
   // One diagram per session, chosen by the server. Kept here only to key the
   // canvas and to label the bar - there is nothing to pick.
   const [diagram, setDiagram] = useState('main')
@@ -98,6 +107,11 @@ export default function App () {
   // diagrams are gitignored working state; main is what a pull request reviews.
   const [mainGraph, setMainGraph] = useState(null)
   const [confirmPromote, setConfirmPromote] = useState(false)
+  // Clearing empties the whole session diagram, so it warns first. `cleared` is
+  // what it removed, held so Ctrl+Z can put it back.
+  const [confirmClear, setConfirmClear] = useState(false)
+  const [cleared, setCleared] = useState(null)
+  const clearAnchor = useRef(null)
   // Pane width is a per-machine preference, so it lives in localStorage rather
   // than in the workspace config that travels between repos.
   const [chatWidth, setChatWidth] = useState(() => {
@@ -272,7 +286,7 @@ export default function App () {
 
   const arrangeWithAI = () => {
     if (!graph) return
-    setQueuedPrompt({ text: arrangePrompt(crossingCount(graph)), allowLayout: true })
+    setQueuedPrompt({ text: ARRANGE_PROMPT, allowLayout: true })
   }
 
   // A turn that only moved boxes leaves the structure key unchanged, so the canvas
@@ -298,6 +312,60 @@ export default function App () {
     setConfirmPromote(false)
     if (mainGraph) setMainGraph(res.graph)
   }
+
+  // Which repo and diagram a clear came from. Undo must land on the same one.
+  const diagramKey = `${activeId}:${diagram}`
+
+  const clearCanvas = async () => {
+    setConfirmClear(false)
+    const res = await post('/api/graph/clear')
+    setSelection(null)
+    setGraph(res.graph)
+    setCleared({ key: diagramKey, graph: res.previous })
+  }
+
+  // A plain save of what the server handed back, positions and colours included.
+  const undoClear = async () => {
+    if (!cleared) return
+    setCleared(null)
+    await save(cleared.graph)
+  }
+
+  // Undo is only good while the diagram is still the empty one the clear left.
+  // Once anything lands on it - a drawn box, an agent turn - restoring would throw
+  // that away too; on another diagram it would overwrite the wrong one.
+  useEffect(() => {
+    if (!cleared) return
+    const empty = graph && !graph.nodes.length && !graph.edges.length
+    if (!empty || cleared.key !== diagramKey) setCleared(null)
+  }, [graph, diagramKey])
+
+  // An open warning must not outlive the diagram it was about.
+  useEffect(() => setConfirmClear(false), [diagramKey, busy, !!mainGraph])
+
+  useEffect(() => {
+    if (!confirmClear) return
+    const away = e => { if (!clearAnchor.current?.contains(e.target)) setConfirmClear(false) }
+    window.addEventListener('pointerdown', away, true)
+    return () => window.removeEventListener('pointerdown', away, true)
+  }, [confirmClear])
+
+  // Caught on the way down, ahead of Excalidraw: its own history knows nothing
+  // about graph.json, and would bring back boxes the graph no longer has. Typing
+  // in the prompt box or a label keeps its own undo.
+  useEffect(() => {
+    if (!cleared || busy || mainGraph) return
+    const onKey = e => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key?.toLowerCase() !== 'z') return
+      const t = e.target
+      if (t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
+      e.preventDefault()
+      e.stopPropagation()
+      undoClear()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [cleared, busy, mainGraph])
 
   // Structure by hand goes through the server, exactly like the agent's patch.
   // Drawing a rectangle on the canvas still does nothing.
@@ -372,6 +440,17 @@ export default function App () {
     setGraph(res.graph)
   }
 
+  // An arrow's shape is layout, like a box's position, so nothing is marked as
+  // changed. null puts it back on the automatic route.
+  const reroute = async (id, route) => {
+    const res = await json(`/api/edges/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route })
+    })
+    setGraph(res.graph)
+  }
+
   // A rectangle drawn on the canvas, kept where it was drawn.
   const addDrawnComponent = async ({ label, x, y, w, h }) => {
     const res = await post('/api/nodes', { label, x, y, w, h })
@@ -395,11 +474,15 @@ export default function App () {
     save({ ...graph, nodes: graph.nodes.map(n => (n.id === node.id ? { ...n, ...node } : n)) })
 
   // Layout comes back from the canvas on a debounce; it never changes structure.
+  // It reads the latest graph, not the one from when the timer was set: anything
+  // saved in between - a reshaped arrow, a rename - would otherwise be written
+  // back over with the older copy.
   const saveLayout = positions => {
-    if (!graph) return
-    const nodes = graph.nodes.map(n => (positions[n.id] ? { ...n, ...positions[n.id] } : n))
-    if (JSON.stringify(nodes) === JSON.stringify(graph.nodes)) return
-    save({ ...graph, nodes })
+    const current = graphRef.current
+    if (!current) return
+    const nodes = current.nodes.map(n => (positions[n.id] ? { ...n, ...positions[n.id] } : n))
+    if (JSON.stringify(nodes) === JSON.stringify(current.nodes)) return
+    save({ ...current, nodes })
   }
 
   const acknowledge = async () => {
@@ -410,8 +493,16 @@ export default function App () {
   // The button should name what you recognise. `diagram` is the file on disk
   // (session-5); the session's own title is what you picked it by.
   const currentSession = sessions.find(s => s.sessionId === activeSessionId) ?? null
-  const backTo = currentSession?.title || diagram
-  const backToShort = backTo.length > 26 ? `${backTo.slice(0, 25)}…` : backTo
+  const sessionName = currentSession?.title || diagram
+  const backToShort = sessionName.length > 26 ? `${sessionName.slice(0, 25)}…` : sessionName
+
+  // Main is the committed map, so clearing is for a session's own diagram only.
+  const canClear = !busy && !mainGraph && diagram !== 'main' && !!graph?.nodes.length
+  const clearTitle = diagram === 'main'
+    ? 'Start a session to clear a diagram - main is the committed map'
+    : graph?.nodes.length
+      ? "Remove every component and connection from this session's diagram"
+      : 'Nothing to clear'
 
   // The listeners go on the window, not the 6px handle: during a drag the pointer
   // is over the canvas almost the whole time. They are attached here rather than
@@ -541,7 +632,7 @@ export default function App () {
                 <button
                   onClick={viewMain}
                   title={mainGraph
-                    ? `Back to ${backTo}`
+                    ? `Back to ${sessionName}`
                     : 'Look at the canonical graph.json without leaving your session'}
                 >
                   {mainGraph ? `back to ${backToShort}` : 'view main'}
@@ -567,7 +658,7 @@ export default function App () {
               <button
                 disabled={busy}
                 onClick={arrangeWithAI}
-                title="Let the agent place the boxes by meaning. Moves your boxes - costs a turn."
+                title="Let the agent place the boxes by meaning. Moves every box and clears hand-drawn arrow routes - costs a turn."
               >Arrange with AI</button>
               {newComponent === null ? (
                 <button onClick={() => setNewComponent('')}>+ component</button>
@@ -585,6 +676,41 @@ export default function App () {
                   />
                   <button className="primary" type="submit" disabled={!newComponent.trim()}>Add</button>
                 </form>
+              )}
+              {cleared ? (
+                <button
+                  disabled={busy || !!mainGraph}
+                  onClick={undoClear}
+                  title={`Put back what Clear canvas removed (${UNDO_KEYS})`}
+                >undo clear</button>
+              ) : (
+                <span className="pop-anchor" ref={clearAnchor}>
+                  <button
+                    disabled={!canClear}
+                    onClick={() => setConfirmClear(v => !v)}
+                    title={clearTitle}
+                  >Clear canvas</button>
+                  {confirmClear && (
+                    <div
+                      className="confirm-pop"
+                      role="alertdialog"
+                      aria-labelledby="clear-title"
+                      onKeyDown={e => { if (e.key === 'Escape') setConfirmClear(false) }}
+                    >
+                      <strong id="clear-title">Clear this diagram?</strong>
+                      <p>
+                        Removes all {plural(graph.nodes.length, 'component')} and{' '}
+                        {plural(graph.edges.length, 'connection')} from <b>{sessionName}</b>.{' '}
+                        {UNDO_KEYS} puts them back.
+                      </p>
+                      <div className="confirm-actions">
+                        <button className="danger" onClick={clearCanvas}>Clear it</button>
+                        {/* Focused, so a stray Enter cancels rather than clears. */}
+                        <button autoFocus onClick={() => setConfirmClear(false)}>cancel</button>
+                      </div>
+                    </div>
+                  )}
+                </span>
               )}
             </span>
           )}
@@ -612,6 +738,7 @@ export default function App () {
             onRelink={relink}
             onRecolour={recolour}
             onAddComponent={addDrawnComponent}
+            onReroute={reroute}
           />
         ) : (
           <div className="blank">
@@ -641,6 +768,7 @@ export default function App () {
             fromLabel={graph?.nodes.find(n => n.id === selectedEdge.from)?.label ?? selectedEdge.from}
             toLabel={graph?.nodes.find(n => n.id === selectedEdge.to)?.label ?? selectedEdge.to}
             onRelabel={relabel}
+            onResetRoute={id => reroute(id, null)}
             onDelete={deleteEdge}
             onClose={() => setSelection(null)}
             locked={busy || !!mainGraph}

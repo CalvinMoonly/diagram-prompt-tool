@@ -1,4 +1,9 @@
-import { convertToExcalidrawElements } from '@excalidraw/excalidraw'
+import { convertToExcalidrawElements, FONT_FAMILY } from '@excalidraw/excalidraw'
+
+// Every label on the diagram, and what the canvas types new text in. Nunito is
+// Excalidraw's own "Normal" and ships in its fonts folder, so it is served locally
+// like the rest - an arbitrary web font would need the plugin in vite.config.js.
+export const FONT = FONT_FAMILY.Nunito
 
 const KIND_COLOURS = {
   service: { stroke: '#1971c2', fill: '#d0ebff' },
@@ -119,7 +124,8 @@ function anchorPoints (graph) {
   for (const edge of graph.edges) {
     const a = byId.get(edge.from)
     const b = byId.get(edge.to)
-    if (!a || !b) continue
+    // A hand-routed arrow attaches where its route says, not in the fan.
+    if (!a || !b || edge.route) continue
     const [fa, fb] = facesFor(a, b)
     faces.set(edge.id, [fa, fb])
     for (const [nodeId, face, other, end] of [[edge.from, fa, b, 'a'], [edge.to, fb, a, 'b']]) {
@@ -151,6 +157,226 @@ function anchorPoints (graph) {
   return { at, faces }
 }
 
+// --- hand routes ---------------------------------------------------------------
+// An arrow the user (or an Arrange turn) shaped: `route` is { from, to, via }, the
+// side of each box it attaches to and the bends it passes through, in canvas units.
+// Bends stay where they were put when a box moves; the ends re-attach to their
+// side. It is still drawn square, whatever shape the bends were left in.
+
+// Where an arrow leaves `face`, GAP out from the box: in line with `toward` when
+// that lies along the face, so the first leg is straight, else as near as fits.
+const INSET = 12
+function stubAt (n, face, [tx, ty]) {
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v))
+  const upright = face === 'left' || face === 'right'
+  const [x, y] = upright
+    ? [face === 'left' ? n.x : n.x + n.w, clamp(ty, n.y + INSET, n.y + n.h - INSET)]
+    : [clamp(tx, n.x + INSET, n.x + n.w - INSET), face === 'top' ? n.y : n.y + n.h]
+  // Whole units, like everything stored, or a redraw of a saved route is off by half.
+  return [Math.round(x + NORMAL[face][0] * GAP), Math.round(y + NORMAL[face][1] * GAP)]
+}
+
+// Extend `path`, heading `dir`, to reach q at right angles, and return the heading
+// it arrives on. Keep going first if q is ahead, turn first if it is behind - so
+// dragging one bend moves the segments that meet at it rather than kinking them.
+// When that corner would cut through a box and the other one would not, it takes
+// the other one: two bends only fix the ends of the path between them.
+function walk (path, dir, q, boxes = []) {
+  const p = path[path.length - 1]
+  if (p[0] === q[0] && p[1] === q[1]) return dir
+  const unit = (from, to) => [Math.sign(to[0] - from[0]), Math.sign(to[1] - from[1])]
+  const ahead = (q[0] - p[0]) * dir[0] + (q[1] - p[1]) * dir[1] > 0
+  if (p[0] === q[0] || p[1] === q[1]) {
+    path.push(q)
+    return unit(p, q)
+  }
+  const flat = dir[1] === 0
+  const [first, other] = ahead === flat ? [[q[0], p[1]], [p[0], q[1]]] : [[p[0], q[1]], [q[0], p[1]]]
+  const hits = c => boxes.some(r => segHitsRect(p, c, r) || segHitsRect(c, q, r))
+  const corner = hits(first) && !hits(other) ? other : first
+  path.push(corner, q)
+  return unit(corner, q)
+}
+
+// Join the end of `path` - heading dp - to q, arriving against dq: dq points out of
+// q's box, or is null when q is just a bend. A strict end's leg must run exactly
+// along its direction, because it leaves a box face or an arrowhead sits on it.
+// Tries the few right-angled shapes that could fit - straight, two Ls, two Zs, and
+// two Us that step out of each end first - drops any that set off backwards or
+// arrive the wrong way, and keeps the one crossing fewest boxes, then the simplest.
+// A U always fits, so something always does.
+function join (path, dp, q, dq, boxes, strictP, strictQ) {
+  const p = path[path.length - 1]
+  if (p[0] === q[0] && p[1] === q[1]) return dp
+  const unit = (u, v) => [Math.sign(v[0] - u[0]), Math.sign(v[1] - u[1])]
+  const dot = (u, v) => u[0] * v[0] + u[1] * v[1]
+  const mid = (u, v) => Math.round((u + v) / 2)
+  const po = [p[0] + dp[0] * GAP, p[1] + dp[1] * GAP]
+  const qo = dq ? [q[0] + dq[0] * GAP, q[1] + dq[1] * GAP] : q
+  const shapes = [
+    [],
+    [[q[0], p[1]]],
+    [[p[0], q[1]]],
+    [[mid(p[0], q[0]), p[1]], [mid(p[0], q[0]), q[1]]],
+    [[p[0], mid(p[1], q[1])], [q[0], mid(p[1], q[1])]],
+    [po, [qo[0], po[1]], qo],
+    [po, [po[0], qo[1]], qo]
+  ]
+  let best = null
+  for (const corners of shapes) {
+    const route = simplify([p, ...corners, q])
+    if (!route.every((v, i) => i === 0 || v[0] === route[i - 1][0] || v[1] === route[i - 1][1])) continue
+    const first = unit(route[0], route[1])
+    const last = unit(route[route.length - 2], route[route.length - 1])
+    if (strictP ? first[0] !== dp[0] || first[1] !== dp[1] : dot(first, dp) < 0) continue
+    if (dq && (strictQ ? last[0] !== -dq[0] || last[1] !== -dq[1] : dot(last, dq) > 0)) continue
+    const score = routeScore(route, boxes)
+    if (!best || score < best.score) best = { route, score }
+  }
+  // Only when q sits dead behind p on its own line, so every shape doubles back on
+  // itself: go straight there rather than draw a loop.
+  best ??= { route: simplify([p, [q[0], p[1]], q]) }
+  path.push(...best.route.slice(1))
+  return unit(best.route[best.route.length - 2], best.route[best.route.length - 1])
+}
+
+// `boxes` are the ones a leg should go round if it can: every box on the canvas,
+// the arrow's own two included.
+function handRoute (a, b, route, boxes = [a, b]) {
+  const [autoA, autoB] = facesFor(a, b)
+  const fa = route.from ?? autoA
+  const fb = route.to ?? autoB
+  const via = route.via ?? []
+  const s = stubAt(a, fa, via[0] ?? centre(b))
+  const t = stubAt(b, fb, via[via.length - 1] ?? centre(a))
+  const [outA, intoB] = [NORMAL[fa], NORMAL[fb].map(v => -v)]
+
+  // Every way of leaving the source face against every way of reaching the target
+  // one, keeping the best. Deciding each end on its own went round the wrong end
+  // of a box as often as not, because it could not see where the rest was coming from.
+  let best = null
+  for (const start of ports(a, fa, s)) {
+    // Through the bends. Straight off the face the first leg must stay square-on;
+    // between bends, walk() keeps a dragged bend's segments with it.
+    const path = [...start.pts]
+    let dir = start.dir
+    let strict = start.strict
+    for (const p of via) {
+      dir = strict ? join(path, dir, p, null, boxes, true, false) : walk(path, dir, p, boxes)
+      strict = false
+    }
+    for (const end of ports(b, fb, t)) {
+      const full = [...path]
+      join(full, dir, end.pts[end.pts.length - 1], end.dir, boxes, strict, end.strict)
+      const route = simplify([...full, ...[...end.pts].reverse().slice(1)])
+      const first = [Math.sign(route[1][0] - route[0][0]), Math.sign(route[1][1] - route[0][1])]
+      const [p, q] = [route[route.length - 2], route[route.length - 1]]
+      const last = [Math.sign(q[0] - p[0]), Math.sign(q[1] - p[1])]
+      // Square-on at both faces, or the arrowhead points along its box.
+      if (first[0] !== outA[0] || first[1] !== outA[1] || last[0] !== intoB[0] || last[1] !== intoB[1]) continue
+      const score = routeScore(route, boxes)
+      if (!best || score < best.score) best = { route, score }
+    }
+  }
+  return best?.route ?? simplify([s, ...via, t])
+}
+
+// Fewest boxes crossed, then fewest corners, then shortest.
+function routeScore (route, boxes) {
+  let hits = 0
+  let length = 0
+  for (let k = 0; k < route.length - 1; k++) {
+    if (boxes.some(r => segHitsRect(route[k], route[k + 1], r))) hits++
+    length += Math.abs(route[k + 1][0] - route[k][0]) + Math.abs(route[k + 1][1] - route[k][1])
+  }
+  return hits * 1e6 + route.length * 1e3 + length
+}
+
+// The ways a route can meet `face` of box n at stub point p: straight off it, one
+// step further out, or stepped out and round either end of the face - so it can
+// set off towards whatever it has to reach without doubling back through the box.
+// `dir` is the heading at the last point, pointing away from the box.
+function ports (n, face, p) {
+  const dir = NORMAL[face]
+  const out = [p[0] + dir[0] * GAP, p[1] + dir[1] * GAP]
+  const along = face === 'left' || face === 'right' ? 1 : 0
+  const [lo, hi] = along ? [n.y, n.y + n.h] : [n.x, n.x + n.w]
+  const list = [{ pts: [p], dir, strict: true }, { pts: [p, out], dir, strict: false }]
+  for (const end of [lo - GAP, hi + GAP]) {
+    const round = [...out]
+    round[along] = end
+    const heading = [0, 0]
+    heading[along] = Math.sign(end - out[along])
+    list.push({ pts: [p, out, round], dir: heading, strict: false })
+  }
+  return list
+}
+
+// Which side of a box a point is on - the one it is furthest out past.
+function faceOf (n, [px, py]) {
+  const dx = px < n.x ? n.x - px : Math.max(0, px - (n.x + n.w))
+  const dy = py < n.y ? n.y - py : Math.max(0, py - (n.y + n.h))
+  if (dx === 0 && dy === 0) {
+    const d = { left: px - n.x, right: n.x + n.w - px, top: py - n.y, bottom: n.y + n.h - py }
+    return Object.keys(d).reduce((m, k) => (d[k] < d[m] ? k : m))
+  }
+  return dx >= dy ? (px < n.x ? 'left' : 'right') : (py < n.y ? 'top' : 'bottom')
+}
+
+// Has the user reshaped this arrow, compared with the path we last drew? Only the
+// bends and the sides count: Excalidraw nudges a bound arrow's ends by a pixel or
+// so on its own, and sliding an end along the same side changes nothing we keep.
+export function reshaped (drawn, now, a, b) {
+  if (!drawn || !a || !b) return false
+  const [was, is] = [drawn.slice(1, -1), now.slice(1, -1)]
+  if (was.length !== is.length) return true
+  if (was.some((p, i) => Math.abs(p[0] - is[i][0]) > 1 || Math.abs(p[1] - is[i][1]) > 1)) return true
+  return faceOf(a, drawn[0]) !== faceOf(a, now[0]) ||
+    faceOf(b, drawn[drawn.length - 1]) !== faceOf(b, now[now.length - 1])
+}
+
+// An arrow as the user left it -> the route to store. `points` are absolute, ends
+// included; `a`, `b` and `boxes` (all of them) are as they are on screen now, and
+// `before` is the path as it was drawn. What is stored is the squared-up path, not
+// the raw drag, so the file holds what the canvas shows.
+export function routeFromEdit (points, a, b, boxes = [a, b], before = null) {
+  let pts = points.map(([x, y]) => [Math.round(x), Math.round(y)])
+  // One bend deleted. Corners on a square route work in pairs - the next one turns
+  // the line back - so dropping only the one picked leaves a diagonal that squaring
+  // up can turn straight back into the same corner, and the bend never goes. Take
+  // its partner with it; whatever corner the ends still need is put back.
+  if (before?.length === pts.length + 1) {
+    const k = before.findIndex((p, i) => !pts[i] || Math.abs(p[0] - pts[i][0]) > 1 || Math.abs(p[1] - pts[i][1]) > 1)
+    if (k > 0 && k < before.length - 1) {
+      const partner = k + 1 < before.length - 1 ? k + 1 : k - 1
+      pts = [pts[0], ...before.slice(1, -1).filter((_, i) => i + 1 !== k && i + 1 !== partner), pts[pts.length - 1]]
+        .map(([x, y]) => [Math.round(x), Math.round(y)])
+    }
+  }
+  // A corner dragged somewhere takes both of its segments with it: its untouched
+  // neighbours slide along to keep them square. Otherwise the neighbour pins one
+  // of them, and the corner only half goes where it was put.
+  if (before?.length === pts.length) {
+    const moved = i => Math.abs(pts[i][0] - before[i][0]) > 1 || Math.abs(pts[i][1] - before[i][1]) > 1
+    for (let i = 1; i < pts.length - 1; i++) {
+      if (!moved(i)) continue
+      for (const j of [i - 1, i + 1]) {
+        if (j === 0 || j === pts.length - 1 || moved(j)) continue
+        if (Math.abs(before[j][0] - before[i][0]) < 1) pts[j] = [pts[i][0], pts[j][1]]
+        else if (Math.abs(before[j][1] - before[i][1]) < 1) pts[j] = [pts[j][0], pts[i][1]]
+      }
+    }
+  }
+  const path = simplify(pts)
+  const raw = { from: faceOf(a, path[0]), to: faceOf(b, path[path.length - 1]), via: path.slice(1, -1) }
+  const drawn = handRoute(a, b, raw, boxes)
+  // A straight arrow still keeps one point on its line: with no bends at all, a
+  // redraw aims each end at the other box's centre and comes back as a Z.
+  const [s, t] = [drawn[0], drawn[drawn.length - 1]]
+  const via = drawn.length > 2 ? drawn.slice(1, -1) : [[Math.round((s[0] + t[0]) / 2), Math.round((s[1] + t[1]) / 2)]]
+  return { from: raw.from, to: raw.to, via }
+}
+
 // Every route is orthogonal - a diagonal gives no clue where it is going. When no
 // corridor is clear, the least-bad one is chosen rather than falling back to a
 // straight line across the diagram.
@@ -164,10 +390,25 @@ export function routeAll (graph) {
   const clashes = (used, pos, lo, hi) =>
     used.filter(u => Math.abs(u.pos - pos) < MIN_GAP && u.hi > lo && u.lo < hi).length
 
+  // Hand routes first: they are fixed, and the automatic ones should keep clear
+  // of them the same way they keep clear of each other.
   for (const edge of graph.edges) {
     const a = byId.get(edge.from)
     const b = byId.get(edge.to)
-    if (!a || !b) continue
+    if (!a || !b || !edge.route) continue
+    const route = handRoute(a, b, edge.route, graph.nodes)
+    for (let k = 0; k < route.length - 1; k++) {
+      const [[x1, y1], [x2, y2]] = [route[k], route[k + 1]]
+      if (x1 === x2) usedV.push({ pos: x1, lo: Math.min(y1, y2), hi: Math.max(y1, y2) })
+      else usedH.push({ pos: y1, lo: Math.min(x1, x2), hi: Math.max(x1, x2) })
+    }
+    routes.set(edge.id, route)
+  }
+
+  for (const edge of graph.edges) {
+    const a = byId.get(edge.from)
+    const b = byId.get(edge.to)
+    if (!a || !b || edge.route) continue
     const [fa, fb] = faces.get(edge.id)
     const pa = at.get(`${edge.id}:a`)
     const pb = at.get(`${edge.id}:b`)
@@ -183,7 +424,8 @@ export function routeAll (graph) {
 
     // Two shapes, both orthogonal: a corridor across the gap between the boxes,
     // or a lane that goes around everything in the way. Sampled past both ends,
-    // because the clear corridor is often outside the direct span.
+    // because the clear corridor is often outside the direct span. `run` is the
+    // extent of the long middle segment, which is what other routes must keep clear of.
     const candidates = []
     const steps = 40
     for (let i = -12; i <= steps + 12; i++) {
@@ -192,6 +434,7 @@ export function routeAll (graph) {
       candidates.push({
         axis: horizontal,
         mid,
+        run: [lo, hi],
         route: horizontal
           ? [s, [mid, s[1]], [mid, t[1]], t]
           : [s, [s[0], mid], [t[0], mid], t],
@@ -202,16 +445,31 @@ export function routeAll (graph) {
       n.x + n.w > Math.min(s[0], t[0]) - 300 && n.x < Math.max(s[0], t[0]) + 300 &&
       n.y + n.h > Math.min(s[1], t[1]) - 300 && n.y < Math.max(s[1], t[1]) + 300)
     const box = near.length ? near : graph.nodes
-    for (const lane of horizontal
-      ? [Math.min(...box.map(n => n.y)) - 40, Math.max(...box.map(n => n.y + n.h)) + 40]
-      : [Math.min(...box.map(n => n.x)) - 40, Math.max(...box.map(n => n.x + n.w)) + 40]) {
+    // Lanes go round the outside of everything near, and through every gap between
+    // rows (or columns) of boxes, a track either side of its middle. With only the
+    // two outer lanes, a grid - where each row's boxes sit on one line, so a
+    // corridor's legs run through the neighbours in between - sent every long arrow
+    // down the same outer lane, drawn on top of each other: 12 overlaps on bab-lc.
+    const ends = (horizontal ? box.flatMap(n => [n.y, n.y + n.h]) : box.flatMap(n => [n.x, n.x + n.w]))
+      .sort((p, q) => p - q)
+    const lanes = new Set([ends[0] - 40, ends[ends.length - 1] + 40])
+    for (let i = 0; i < ends.length - 1; i++) {
+      if (ends[i + 1] - ends[i] < 2 * (MARGIN + MIN_GAP)) continue
+      const m = Math.round((ends[i] + ends[i + 1]) / 2)
+      for (const at of [m, m - MIN_GAP, m + MIN_GAP]) lanes.add(at)
+    }
+    const [aEnd, bEnd] = horizontal ? [s[1], t[1]] : [s[0], t[0]]
+    for (const lane of lanes) {
       candidates.push({
         axis: !horizontal,
         mid: lane,
+        run: [Math.min(from, to), Math.max(from, to)],
         route: horizontal
           ? [s, [s[0], lane], [t[0], lane], t]
           : [s, [lane, s[1]], [lane, t[1]], t],
-        near: 1.5
+        // Always behind a clear corridor (those score under 0.8); between lanes,
+        // the one that strays least from the two ends.
+        near: 1 + (Math.abs(aEnd - lane) + Math.abs(lane - bEnd) - Math.abs(aEnd - bEnd)) / 1000
       })
     }
 
@@ -222,10 +480,10 @@ export function routeAll (graph) {
         if (blockers.some(r => segHitsRect(c.route[k], c.route[k + 1], r))) blocked++
       }
       const used = c.axis ? usedV : usedH
-      const score = blocked * 10 + clashes(used, c.mid, lo, hi) * 3 + c.near
+      const score = blocked * 10 + clashes(used, c.mid, c.run[0], c.run[1]) * 3 + c.near
       if (!best || score < best.score) best = { ...c, score }
     }
-    ;(best.axis ? usedV : usedH).push({ pos: best.mid, lo, hi })
+    ;(best.axis ? usedV : usedH).push({ pos: best.mid, lo: best.run[0], hi: best.run[1] })
     routes.set(edge.id, simplify(best.route))
   }
   return routes
@@ -338,7 +596,7 @@ export function graphToElements (graph, selection) {
       fillStyle: 'solid',
       strokeWidth: node.touched ? 4 : 2,
       roundness: { type: 3 },
-      label: { text: node.label, fontSize: 20, strokeColor: '#1e1e1e', opacity },
+      label: { text: node.label, fontSize: 20, fontFamily: FONT, strokeColor: '#1e1e1e', opacity },
       customData: { nodeId: node.id, kind: node.kind }
     })
   }
@@ -368,31 +626,12 @@ export function graphToElements (graph, selection) {
       start: { id: `node:${edge.from}` },
       end: { id: `node:${edge.to}` },
       strokeColor: '#495057',
-      ...(edge.label ? { label: { text: edge.label, fontSize: 14, opacity: edgeOpacity } } : {}),
+      ...(edge.label ? { label: { text: edge.label, fontSize: 14, fontFamily: FONT, opacity: edgeOpacity } } : {}),
       customData: { edgeId: edge.id }
     })
   }
 
   return convertToExcalidrawElements(skeleton, { regenerateIds: false })
-}
-
-// How many arrows currently run through a box that is not their own endpoint.
-// The agent cannot see the canvas, so this is how the problem gets described to it.
-export function crossingCount (graph) {
-  const routes = routeAll(graph)
-  let hits = 0
-  let counted = 0
-  for (const edge of graph.edges) {
-    const route = routes.get(edge.id)
-    if (!route) continue
-    counted++
-    const rects = graph.nodes
-      .filter(n => n.id !== edge.from && n.id !== edge.to)
-      .map(inflate)
-    const crosses = route.slice(0, -1).some((p, i) => rects.some(r => segHitsRect(p, route[i + 1], r)))
-    if (crosses) hits++
-  }
-  return { hits, counted }
 }
 
 // Canvas -> graph: we only read back layout, never structure.

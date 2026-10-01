@@ -36,7 +36,7 @@
       "paths": [
         "server/tools.mjs"
       ],
-      "notes": "In-process SDK MCP server exposing get_graph, get_node and patch_graph. Rebuilt per turn with the active workspace dir closed over, so the agent can only touch that repo's graph.",
+      "notes": "In-process SDK MCP server exposing get_graph, get_node and patch_graph, plus set_layout (box positions and arrow routes) on an Arrange turn only. Rebuilt per turn with the active workspace dir closed over, so the agent can only touch that repo's graph.",
       "x": 1080,
       "y": 227,
       "w": 220,

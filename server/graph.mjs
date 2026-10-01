@@ -44,6 +44,27 @@ const COLS = 4
 
 export const KINDS = ['service', 'datastore', 'queue', 'device', 'external', 'job', 'ui']
 
+// An arrow's hand-drawn shape: which side of each box it attaches to, and the bends
+// it passes through, in canvas units. Layout, like a box's x/y, and the user's
+// alone: the agent cannot route, and an Arrange turn clears every route. Anything
+// malformed is dropped rather than half-kept, and an empty one is no route at all.
+const SIDES = ['top', 'right', 'bottom', 'left']
+function cleanRoute (raw) {
+  if (!raw || typeof raw !== 'object') return null
+  const route = {}
+  if (SIDES.includes(raw.from)) route.from = raw.from
+  if (SIDES.includes(raw.to)) route.to = raw.to
+  const via = Array.isArray(raw.via)
+    ? raw.via
+      .map(p => (Array.isArray(p) ? p : [p?.x, p?.y]))
+      .filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]))
+      .slice(0, 40)
+      .map(p => [Math.round(p[0]), Math.round(p[1])])
+    : []
+  if (via.length) route.via = via
+  return Object.keys(route).length ? route : null
+}
+
 export async function readGraph (dir, name = MAIN) {
   try {
     const raw = await fs.readFile(graphPathFor(dir, name), 'utf8')
@@ -62,7 +83,10 @@ export async function writeGraph (dir, name, graph) {
   const next = normalise(graph)
   const file = graphPathFor(dir, name)
   await fs.mkdir(path.dirname(file), { recursive: true })
-  await fs.writeFile(file, JSON.stringify(next, null, 2) + '\n', 'utf8')
+  // A bend point on one line, [x, y], rather than four - a route stays readable in
+  // a diff. Numeric pairs are the only arrays of numbers in the file.
+  const text = JSON.stringify(next, null, 2).replace(/\[\s+(-?\d+),\s+(-?\d+)\s+\]/g, '[$1, $2]')
+  await fs.writeFile(file, text + '\n', 'utf8')
   return next
 }
 
@@ -180,6 +204,8 @@ function normalise (graph) {
     .map(e => {
       const edge = { id: e.id || `e-${e.from}-${e.to}`, from: e.from, to: e.to }
       if (e.label) edge.label = e.label
+      const route = cleanRoute(e.route)
+      if (route) edge.route = route
       return edge
     })
 
@@ -205,11 +231,18 @@ export function applyPatch (graph, patch) {
     const i = nodes.findIndex(n => n.id === id)
     if (i !== -1) nodes.splice(i, 1)
   }
-  for (const incoming of patch.upsertEdges ?? []) {
+  for (const { route, ...incoming } of patch.upsertEdges ?? []) {
+    // An arrow's shape is layout, same as a box's position: never from a patch.
+    // A connection whose ends change gets a fresh route; the old bends were for
+    // the old ends.
     const id = incoming.id || `e-${incoming.from}-${incoming.to}`
     const i = edges.findIndex(e => e.id === id)
     if (i === -1) edges.push({ ...incoming, id })
-    else edges[i] = { ...edges[i], ...incoming, id }
+    else {
+      const { route: kept, ...before } = edges[i]
+      const moved = (incoming.from && incoming.from !== before.from) || (incoming.to && incoming.to !== before.to)
+      edges[i] = { ...before, ...incoming, id, ...(kept && !moved ? { route: kept } : {}) }
+    }
     // A changed dependency implicates both ends, so both light up. Without this
     // the tool reports endpoints as marked that were never actually flagged.
     for (const end of [incoming.from, incoming.to]) {

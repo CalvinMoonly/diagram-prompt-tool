@@ -96,11 +96,19 @@ The canvas is a real editor. You can:
 - **double-click either** — renames it
 - **drag an arrow's end onto another box** — moves the connection
 - **drag or resize a box** — layout is yours and always has been
+- **reshape an arrow** — select it and drag a bend, pull a new one out of a segment,
+  click a bend and press Delete to remove it, or drag its end to another side of the same
+  box. It squares itself up and stays: bends stay where you put them when boxes move, and
+  the ends keep their side. **Reset route** in the arrow's panel puts it back on the
+  automatic route
 - **recolour a box** — Excalidraw's stroke/background pickers now stick. Colour normally
   comes from the component's *kind* (green datastore, purple queue, teal job), so an
   override breaks that box out of the legend; the inspector offers a one-click **reset to
   the kind colour**. The agent can never set a colour — its lever is `kind`
 - **+ component** / the inspector — the same things via forms, plus **delete**
+- **Clear canvas** — empties this session's diagram after a warning. Ctrl+Z (⌘Z), or the
+  **undo clear** button that takes its place, puts everything back until you add anything
+  else. Not available on `main`, the committed map
 
 Every one of those goes through the server, exactly like the agent's `patch_graph` — the
 canvas never writes `graph.json` directly. The one thing it will not do is delete:
@@ -148,9 +156,13 @@ is the file a pull request reviews).
 Arrows are routed at right angles and steer around boxes; a diagonal tells you nothing
 about where a line is going, so there aren't any.
 
-**Arrange with AI** is what moves the boxes. It costs a turn and can take several
-minutes, but on a 36-node diagram it placed every box so that *no* arrow crosses a box.
-It is the only thing that may move your boxes, and only when you press it.
+**Arrange with AI** is what moves the boxes. The agent decides which column and row each
+box goes in - who sits next to whom, one region per subsystem - and the server turns that
+into positions, making every gap wide enough for the labels on the arrows that cross it.
+Boxes in a row or column line up exactly, so neighbours get straight arrows. It clears
+any hand-drawn arrow routes, since they were drawn for the old layout, and it runs on its
+own rather than inside your conversation, so it does not show in the transcript after a
+reload. It is the only thing that may move your boxes, and only when you press it.
 
 There was an offline `Tidy layout` button that arranged boxes along the flow of the
 arrows. It was removed: measured on real graphs it helped about as often as it hurt
@@ -167,7 +179,7 @@ position is remembered per browser.
 | `get_graph` | reads the whole map: nodes, kinds, owned folders, edges |
 | `get_node` | one node plus its neighbours |
 | `patch_graph` | adds/edits/removes nodes and edges, marks them as changed |
-| `set_layout` | moves boxes, positions only — **only** on an *Arrange with AI* turn |
+| `set_layout` | a grid cell per box, which the server turns into positions spaced for the arrow labels — **only** on an *Arrange with AI* turn. Clears hand-drawn arrow routes |
 
 They live in `server/tools.mjs` as an in-process MCP server. Add a tool there and the
 agent can use it on the next message — no restart of anything but the server.
@@ -181,11 +193,12 @@ agent can use it on the next message — no restart of anything but the server.
 - **Node kinds** in `server/tools.mjs` and `web/src/graphToScene.js` — currently generic.
   Yours are probably more like `edge-node`, `ota-channel`, `booking-provider`.
 - **`systemPrompt`** — the `{ type: 'preset', preset: 'claude_code', append }` shape is
-  verified against Agent SDK 0.3.269. If a version bump breaks it, that is the line to check.
+  verified against Agent SDK 0.3.286. If a version bump breaks it, that is the line to check.
 - **Model choice** — pick it from the dropdown under the prompt box (Opus / Sonnet /
   Haiku, or the SDK default). It is stored in `~/.promptcanvas/workspaces.json` and the
   resolved model id is shown beside it after each turn. `MODELS` in `server/index.mjs`
-  is the list.
+  is the list. The aliases resolve inside the Claude Code the SDK bundles, so a newer
+  model arrives with an SDK upgrade: 0.3.286 maps "opus" to Opus 5.5.
 
 ## Known rough edges in this skeleton
 
@@ -214,5 +227,5 @@ agent can use it on the next message — no restart of anything but the server.
   horizontal pairs from *different* boxes can still land 3–4px apart.
 - Past roughly 30 nodes no arrangement reads well on its own — that is what focus mode is
   for.
-- `Arrange with AI` is slow: emitting one position per box as structured tool input takes
-  a few minutes for 30-odd boxes. The spinner tells you it is still alive.
+- `Arrange with AI` used to take over three minutes, almost all of it the agent reasoning
+  about pixel positions. It now only picks cells; a real run has not been timed yet.

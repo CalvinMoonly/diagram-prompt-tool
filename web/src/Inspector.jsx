@@ -66,10 +66,11 @@ export default function Inspector ({ node, onSave, onDelete, onResetColour, onCl
   )
 }
 
-// A connection has nothing to edit - no label route, no folders of its own - so its
-// panel exists for one reason: to say what it joins and let you remove it. Same
-// shell as the node inspector, which is also where it gets its z-index from.
-export function EdgePanel ({ edge, fromLabel, toLabel, onRelabel, onDelete, onClose, locked }) {
+// A connection has little to edit - no folders of its own - so its panel is there
+// to say what it joins, rename it, put a hand-drawn route back on automatic, and
+// remove it. Same shell as the node inspector, which is also where it gets its
+// z-index from.
+export function EdgePanel ({ edge, fromLabel, toLabel, onRelabel, onResetRoute, onDelete, onClose, locked }) {
   const [confirming, setConfirming] = useState(false)
   const [label, setLabel] = useState(edge?.label ?? '')
   useEffect(() => setConfirming(false), [edge?.id])
@@ -90,6 +91,17 @@ export function EdgePanel ({ edge, fromLabel, toLabel, onRelabel, onDelete, onCl
           onChange={e => setLabel(e.target.value)}
         />
       </label>
+
+      <p className="hint">
+        Drag a bend to move it, or click a bend and press Delete to remove it. Drag the
+        arrow's end to another side of its box to change where it attaches.
+      </p>
+      {edge.route && (
+        <div className="inspector-actions">
+          <button disabled={!!locked} onClick={() => onResetRoute(edge.id)}>Reset route</button>
+          <span className="hint">Routed by hand - its bends stay put when boxes move.</span>
+        </div>
+      )}
 
       <p className="hint">
         Removing a connection leaves both components in place. Ask the agent if you want
